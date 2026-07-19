@@ -1,0 +1,7 @@
+{
+  "name": "tailwind-src",
+  "version": "10.0.0",
+  "description": "tailwind userscript bundle, un-bundled. just for reading, not a build.",
+  "author": "jason",
+  "license": "MIT"
+}
