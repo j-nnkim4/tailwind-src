@@ -2358,7 +2358,7 @@ class AutoPlace {
         var tick = config.tick;
         if (this._pgCache !== undefined && this._pgCache.tick === tick) return this._pgCache;
         var shouldQuadTrap = heldPlaceBinds.indexOf("trap") !== -1 && combatManager.player && combatIntel.nearestEnemy
-        && (combatIntel.nearestEnemy.x2 - combatManager.player.x2) * (combatIntel.nearestEnemy.x2 - combatManager.player.x2) + (combatIntel.nearestEnemy.y2 - combatManager.player.y2) * (combatIntel.nearestEnemy.y2 - combatManager.player.y2) <= (autoPlaceRadius + 150) * (autoPlaceRadius + 150);
+        && (combatIntel.nearestEnemy.x2 - combatManager.player.x2) * (combatIntel.nearestEnemy.x2 - combatManager.player.x2) + (combatIntel.nearestEnemy.y2 - combatManager.player.y2) * (combatIntel.nearestEnemy.y2 - combatManager.player.y2) <= (autoPlaceRadius * 2) * (autoPlaceRadius * 2);
         if (shouldQuadTrap) return (this._pgCache = this.quadTrapData());
         var result = this.gradePlacements();
         var top = null, others = null;
