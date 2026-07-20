@@ -100,6 +100,7 @@ class SafeWalk {
         if (combatManager.active || combatManager.shiftHeld) return;
         if (!o || !o.active) return;
         if (!((o.dmg > 0 && !o.cactus && o.health != undefined && o.owner && !isAlly(o.owner.sid)) || (o.teleport && o.health != undefined)
+              || (o.boostSpeed && o.health != undefined && o.owner)
               || (anyBuilding && o.health != undefined && o.owner))) return;
         var player = combatManager.player;
         var keepDefensive = combatIntel.hasInstaThreat() || combatIntel.dangerWithoutSoldier;
@@ -182,8 +183,8 @@ class SafeWalk {
             var o = near[i];
             if (!o.active) continue;
             var enemyOwned = o.owner && !isAlly(o.owner.sid);
-            if (!(o.cactus || (o.dmg > 0 && enemyOwned) || o.teleport || (o.boostSpeed && enemyOwned))) continue;
-            var isBreakablePath = (o.dmg > 0 && !o.cactus && o.health != undefined && enemyOwned) || (o.teleport && o.health != undefined);
+            if (!(o.cactus || (o.dmg > 0 && enemyOwned) || o.teleport || o.boostSpeed)) continue;
+            var isBreakablePath = (o.dmg > 0 && !o.cactus && o.health != undefined && enemyOwned) || (o.teleport && o.health != undefined) || (o.boostSpeed && o.health != undefined);
             var dpx = o.x - cx, dpy = o.y - cy;
             if (dpx * dpx + dpy * dpy > 250000) continue;
             var scale = (o.teleport ? o.scale * 0.75 : o.scale) + config.playerScale;
@@ -2291,7 +2292,8 @@ class AutoPlace {
                     if (sPlyrDist2 <= autoPlaceRadius * autoPlaceRadius && seg.traps >= 1 && lsDiff >= 3) points += seg.traps * 0.15;
                 } else {
                     var ppdx = posx - nearest.x2, ppdy = posy - nearest.y2, plyrDist2 = ppdx * ppdx + ppdy * ppdy;
-                    if (plyrDist2 <= 235 * 235 && !nearest.trapped) points += 1;
+                    if (plyrDist2 <= 235 * 235) points += 1;
+                    if (nearest.trapped && plyrDist2 <= 250 * 250 && (angleDist(angle, angToTrap) >= 1.5 || moveDir == null)) points += 2;
                     if (plyrDist2 <= 20.4 * 20.4) points += 0.5;
                     var besideSpikes = 0;
                     for (var bs = 0; bs < objectManager.nearObjectCount; ++bs) {
@@ -2482,6 +2484,7 @@ class AutoPlace {
                 createSpikeKB(c.victim, c.into.chainHops[0].x, c.into.chainHops[0].y);
             }
             combatManager.place(c.type, c.angle);
+            this.blindGhostAt(c.x, c.y, c.scale);
             if (!this.#hasRecent(c.x, c.y, c.scale)) this.recentPlacements.push({ x: c.x, y: c.y, scale: c.scale, time: Date.now(), seen: Date.now() });
         }
     }
@@ -3733,6 +3736,7 @@ class SpikeSync {
         if (combatIntel.shouldIgnoreAction() || nearest === null || placementAngles === null || !notStick || !primaryReloaded) return;
         var range = combatManager.weaponReach(nearest, primary);
         if (!combatIntel.near(player, nearest, range)) return;
+        if (!nearest.trapped && !nearest.trappedPrevious) return;
         if (combatManager.retrapPrioritySID != null && ((nearest.trapped && nearest.trapped.sid === combatManager.retrapPrioritySID) || (nearest.trappedPrevious && nearest.trappedPrevious.sid === combatManager.retrapPrioritySID))) return;
         var contestedTrap = combatManager.breakPunishSID;
         if (contestedTrap != null && ((nearest.trapped && nearest.trapped.sid === contestedTrap) || (nearest.trappedPrevious && nearest.trappedPrevious.sid === contestedTrap)) && (config.tick % 6) !== 5) return;
@@ -8692,7 +8696,7 @@ function updateGame() {
                                 mainContext.fillStyle = darkOutlineColor;
                                 mainContext.roundRect(thX, thY, thW, thH, 7);
                                 mainContext.fill();
-                                mainContext.fillStyle = "rrgba(190, 65, 80, 0.7)";
+                                mainContext.fillStyle = "rgba(190, 65, 80, 0.7)";
                                 mainContext.roundRect(thX, thY, thW, thH, 7);
                                 mainContext.fill();
                             }
@@ -9263,7 +9267,7 @@ function renderAutoPlace(ctx, xOffset, yOffset) {
 
     for (var ci = 0; ci < chosen.length; ++ci) {
         var cand = chosen[ci];
-        if (cand.syncGhost) continue;
+        if (cand.syncGhost || autoPlace.ghostSuppressed(cand.x, cand.y, cand.scale)) continue;
         var px = cand.x - xOffset, py = cand.y - yOffset;
         var ccolor = placeGradeColors[cand.analytic] || "#808080";
         drawWhyLine(ctx, cand, px, py, ccolor, xOffset, yOffset);
@@ -9301,7 +9305,7 @@ function renderPlaceChips(ctx, xOffset, yOffset) {
     if (!chosen || chosen.length === 0) return;
     for (var ci = 0; ci < chosen.length; ++ci) {
         var cand = chosen[ci];
-        if (cand.syncGhost) continue;
+        if (cand.syncGhost || autoPlace.ghostSuppressed(cand.x, cand.y, cand.scale)) continue;
         var px = cand.x - xOffset, py = cand.y - yOffset;
         var ccolor = placeGradeColors[cand.analytic] || "#808080";
         drawChip(ctx, px, py, cand.scale + 2, cand.preplace ? "p" : cand.points.toFixed(1), ccolor);
