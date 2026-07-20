@@ -8677,7 +8677,7 @@ function updateGame() {
                         mainContext.fill();
 
                         var healthFrac = smoothBarFill(tmpObj, "health", tmpObj.health / tmpObj.maxHealth, delta, true, 41);
-                        mainContext.fillStyle = (tmpObj == player) ? (settings.visuals.uiMetrics ? "#7A9874" : "#8ecc51") : ((tmpObj.team && tmpObj.team == player.team) ? (settings.visuals.uiMetrics ? "#B2B159" : "#8ecc51") : (settings.visuals.uiMetrics ? "rgba(176, 40, 58, 0.7)" : "#cc5151"));
+                        mainContext.fillStyle = (tmpObj == player) ? (settings.visuals.uiMetrics ? "#7A9874" : "#8ecc51") : ((tmpObj.team && tmpObj.team == player.team) ? (settings.visuals.uiMetrics ? "#B2B159" : "#8ecc51") : (settings.visuals.uiMetrics ? "rgba(190, 65, 80, 0.7)" : "#cc5151"));
 
                         mainContext.roundRect(tmpObj.x - xOffset - config.healthBarWidth,
                                               (tmpObj.y - yOffset + tmpObj.scale) + config.nameY + config.healthBarPad,
@@ -8692,7 +8692,7 @@ function updateGame() {
                                 mainContext.fillStyle = darkOutlineColor;
                                 mainContext.roundRect(thX, thY, thW, thH, 7);
                                 mainContext.fill();
-                                mainContext.fillStyle = "rgba(176, 40, 58, 0.7)";
+                                mainContext.fillStyle = "rrgba(190, 65, 80, 0.7)";
                                 mainContext.roundRect(thX, thY, thW, thH, 7);
                                 mainContext.fill();
                             }
