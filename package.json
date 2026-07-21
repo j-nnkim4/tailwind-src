@@ -1,7 +1,17 @@
 {
   "name": "tailwind-src",
   "version": "10.0.0",
-  "description": "tailwind userscript bundle, un-bundled. just for reading, not a build.",
+  "description": "tailwind userscript bundle, un-bundled. just for reading, not a build. also hosts the private chat relay.",
   "author": "jason",
-  "license": "MIT"
+  "license": "MIT",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "ws": "^8.18.0"
+  }
 }
