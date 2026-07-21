@@ -9,9 +9,94 @@ function findMiddleAngle(a, b) {
 
 var isProd = location.hostname !== "localhost" && location.hostname !== "127.0.0.1" && !location.hostname.startsWith("192.168.");
 
+var syncSignal = { tick: -100, partnerSID: null, targetSID: null };
+
+function gameServerKey() {
+    var m = /server=([^&]+)/.exec(location.search);
+    return m ? m[1] : "solo";
+}
+
+class Relay {
+    #url = "wss://tailwind-bege.onrender.com";
+    #socket = null;
+    #retryTimer = null;
+    #retryDelay = 1000;
+    #id = null;
+    #sentName = null;
+
+    identity() {
+        if (this.#id) return this.#id;
+        try { this.#id = localStorage.getItem("tailwindWSID"); } catch (e) {}
+        if (!this.#id) {
+            this.#id = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
+            try { localStorage.setItem("tailwindWSID", this.#id); } catch (e) {}
+        }
+        return this.#id;
+    }
+
+    connect() {
+        if (this.#socket && (this.#socket.readyState === 0 || this.#socket.readyState === 1)) return;
+        try { this.#socket = new WebSocket(this.#url); } catch (e) { this.#retry(); return; }
+        this.#socket.onopen = () => { this.#retryDelay = 1000; this.#register(); };
+        this.#socket.onmessage = (e) => this.#receive(e.data);
+        this.#socket.onclose = () => this.#retry();
+        this.#socket.onerror = () => {};
+    }
+
+    send(payload) {
+        if (this.#isOpen()) this.#socket.send(JSON.stringify(payload));
+    }
+
+    say(text) {
+        if (!this.#isOpen()) { addWSLog(null, "not connected"); this.connect(); return; }
+        if (this.#name() !== this.#sentName) this.#register();
+        this.send({ t: "say", text: text });
+    }
+
+    publishSync(targetSID, armed) {
+        this.send({ t: "sync", server: gameServerKey(), sid: player.sid, target: targetSID, armed: armed });
+    }
+
+    #isOpen() {
+        return !!this.#socket && this.#socket.readyState === 1;
+    }
+
+    #name() {
+        return (player && player.name) || "anon";
+    }
+
+    #register() {
+        this.#sentName = this.#name();
+        this.send({ t: "registration", id: this.identity(), name: this.#sentName });
+    }
+
+    #retry() {
+        if (this.#retryTimer) return;
+        this.#retryTimer = setTimeout(() => { this.#retryTimer = null; this.connect(); }, this.#retryDelay);
+        this.#retryDelay = Math.min(this.#retryDelay * 2, 30000);
+    }
+
+    #receive(raw) {
+        var msg;
+        try { msg = JSON.parse(raw); } catch (e) { return; }
+        if (msg.t === "say") addWSLog(msg.name, msg.text, msg.from === this.identity());
+        else if (msg.t === "fire") { syncSignal.tick = config.tick; syncSignal.partnerSID = msg.partner; syncSignal.targetSID = msg.target; }
+        else if (msg.t === "presence") addWSLog(null, (msg.name || msg.id) + (msg.online ? " joined" : " left"));
+        else if (msg.t === "error") addWSLog(null, msg.reason);
+    }
+}
+
+var relay = new Relay();
+relay.connect();
+
 __webpack_require__( "./src/js/libs/page.js");
 __webpack_require__( "./src/js/libs/modernizr.js");
 var io = __webpack_require__( "./src/js/libs/io-client.js");
+var ioSendRaw = io.send.bind(io);
+io.send = function(type) {
+    if (settings.visuals.packetLogs && inGame) recordPacket(type, Array.prototype.slice.call(arguments, 1));
+    return ioSendRaw.apply(null, arguments);
+};
 var UTILS = __webpack_require__( "./src/js/libs/utils.js");
 var animText = __webpack_require__( "./src/js/libs/animText.js");
 var config = __webpack_require__( "./src/js/config.js");
@@ -89,6 +174,29 @@ function segHitsCircle(ax, ay, bx, by, cx, cy, r) {
     t = Math.max(0, Math.min(1, t));
     var px = ax + t * dx - cx, py = ay + t * dy - cy;
     return px * px + py * py <= r * r;
+}
+
+function pathBlocker(px, py, gx, gy) {
+    var objs = objectManager.nearObjects, n = objectManager.nearObjectCount;
+    for (var i = 0; i < n; i++) {
+        var o = objs[i];
+        if (!o || !o.active) continue;
+        if (o.trap && o.owner && isAlly(o.owner.sid)) continue;
+        var rad = objSpikeScale(o) + config.playerScale;
+        if (segHitsCircle(px, py, gx, gy, o.x, o.y, rad)) return o;
+    }
+    return null;
+}
+
+function teleporterOnPath(px, py, gx, gy) {
+    var objs = objectManager.nearObjects, n = objectManager.nearObjectCount;
+    for (var i = 0; i < n; i++) {
+        var o = objs[i];
+        if (!o || !o.active || !o.teleport) continue;
+        var rad = objSpikeScale(o) + config.playerScale;
+        if (segHitsCircle(px, py, gx, gy, o.x, o.y, rad)) return true;
+    }
+    return false;
 }
 
 class SafeWalk {
@@ -326,6 +434,22 @@ function projectileThreat(self) {
         else self.dangerProjectiles.delete(proj);
     }
     return total;
+}
+
+function updatesFirst(me, other) {
+    var myRank = me.leaderboard || Infinity, otherRank = other.leaderboard || Infinity;
+    if (myRank !== Infinity || otherRank !== Infinity) return myRank <= otherRank;
+    return other.dOTMeFirst !== false;
+}
+
+function nearVelocity(a, b, range) {
+    var r2 = range * range;
+    var dx = a.x2 - b.x2, dy = a.y2 - b.y2;
+    if (dx * dx + dy * dy <= r2) return true;
+    var predictB = updatesFirst(a, b);
+    var bx = predictB ? futureX(b) : b.x2, by = predictB ? futureY(b) : b.y2;
+    dx = futureX(a) - bx; dy = futureY(a) - by;
+    return dx * dx + dy * dy <= r2;
 }
 
 function isNear(player, target, nearest) {
@@ -949,14 +1073,6 @@ class CombatIntel {
             }
             if (possible.length !== 0) this.nearestSpikePlacerAngle = possible;
         }
-        var best = null, bestD = Infinity;
-        for (var i = 0; i < this.enemies.length; ++i) {
-            var p = this.enemies[i];
-            if (p === nearest || (p.team && nearest.team && p.team === nearest.team)) continue;
-            var pnx = p.x2 - nearest.x2, pny = p.y2 - nearest.y2, d = pnx * pnx + pny * pny;
-            if (d < bestD) { bestD = d; best = p; }
-        }
-        this.nearestEnemyToNearestEnemy = best;
     }
 
     reset() {
@@ -995,7 +1111,6 @@ class CombatIntel {
         this.enemySpikeCollider = null;
         this.nearestKBTrapEnemy = null;
         this.kbTrap = null;
-        this.nearestEnemyToNearestEnemy = null;
         this.nearestSyncEnemy = null;
         this.nearestLowHPObject = null;
         this.nearestSpikePlacerAngle = null;
@@ -1177,7 +1292,8 @@ class HitResolver {
                 obj.hitter = hitter;
                 obj.hitWeapon = hitWeapon;
                 obj.lastDamageTime = Date.now();
-                if (hitter.trapped.sid !== obj.sid && settings.visuals.hitMarkers) {
+                var tdx = player ? obj.x - player.x : Infinity, tdy = player ? obj.y - player.y : Infinity;
+                if (hitter.trapped.sid !== obj.sid && settings.visuals.hitMarkers && tdx * tdx + tdy * tdy <= 500 * 500) {
                     textManager2.showText(obj.x, obj.y, 15, 0, items.weapons[hitWeapon].speed, Math.round(dmg), customColor(obj.owner && obj.owner.sid), "Lilita One", 6.7, obj);
                     obj.dmgTextTime = Date.now() + items.weapons[hitWeapon].speed;
                 }
@@ -1219,6 +1335,7 @@ class CombatManager {
     currentAngle = 0;
     instaToggle = false;
     oneTickToggle = false;
+    syncToggle = false;
     shiftHeld = false;
     lastTankTick = -10;
     tankDouble = false;
@@ -1387,6 +1504,7 @@ class CombatManager {
         if (this.holdGroupItem(0) === null) return;
         this.holdAttack(null);
         this.reselectWeapon();
+        if (combatIntel.trapMeltDamage > 0) this.holdAttack(null);
     }
 
     preClick(lmb, rmb, spacebar) {
@@ -1460,6 +1578,7 @@ class CombatManager {
         if (!keepToggles) {
             this.instaToggle = false;
             this.oneTickToggle = false;
+            this.syncToggle = false;
             this.arHoldOverride = null;
         }
         this.shiftHeld = false;
@@ -1490,7 +1609,8 @@ class CombatManager {
         if (eligible && safe && settingAllows("Retrap") && settings.defense.retrapMove && !this.oneTickToggle) {
             var cov = this.retrapCover(player, enemy, items.list[trapID]);
             var dx = enemy.x2 - player.x2, dy = enemy.y2 - player.y2, d2 = dx * dx + dy * dy;
-            if (d2 > cov.placeScale * cov.placeScale && d2 <= 122500) {
+            var retrapReach = config.playerScale * 4;
+            if (d2 > cov.placeScale * cov.placeScale && d2 <= retrapReach * retrapReach) {
                 this.retrapPositioning = { enemy: enemy, trap: trap, angle: cov.angle, x: cov.x, y: cov.y, gx: enemy.x2 - Math.cos(cov.angle) * cov.placeScale, gy: enemy.y2 - Math.sin(cov.angle) * cov.placeScale, id: trapID };
                 this.retrapPrioritySID = trap.sid;
                 this.retrapPriorityGraceSID = trap.sid;
@@ -1510,7 +1630,7 @@ class CombatManager {
         this.inputDir = inputDir;
         this.clickAim = clickAim;
         this.reset();
-        var manualEngage = this.instaToggle || this.oneTickToggle;
+        var manualEngage = this.instaToggle || this.oneTickToggle || this.syncToggle;
         this.resolveRetrapPriority();
         for (var i = 0; i < this.actions.length; ++i) {
             var action = this.actions[i];
@@ -1623,7 +1743,7 @@ class AutoWindmills {
         this.dir = lastMoveDir + Math.PI;
         if (this.distance >= 97.5 * 97.5) {
             var placeLen = combatManager.itemPlaceScale(player, item);
-            var base = Math.asin((2 * item.scale + 1) / (2 * placeLen));
+            var base = Math.asin((2 * item.scale + (item.name === "power mill" ? 0.5 : 9)) / (2 * placeLen));
             place(player.items[3], this.dir);
             place(player.items[3], this.dir + base * 2);
             place(player.items[3], this.dir - base * 2);
@@ -2484,7 +2604,6 @@ class AutoPlace {
                 createSpikeKB(c.victim, c.into.chainHops[0].x, c.into.chainHops[0].y);
             }
             combatManager.place(c.type, c.angle);
-            this.blindGhostAt(c.x, c.y, c.scale);
             if (!this.#hasRecent(c.x, c.y, c.scale)) this.recentPlacements.push({ x: c.x, y: c.y, scale: c.scale, time: Date.now(), seen: Date.now() });
         }
     }
@@ -2675,7 +2794,7 @@ var dOT = {
     laneHalf: 0.9,
     dashSpan: 30,
     enemySteps: [{}, {}, {}, {}, {}],
-    simTurret: {}, simBull: {},
+    simTurret: {}, simBull: {}, simApproach: [{}, {}],
     turretL: { skinIndex: 53, tailIndex: 0, buildIndex: -1, weaponIndex: 0, y2: 0, zIndex: 0 },
     bullL: { skinIndex: 7, tailIndex: 0, buildIndex: -1, weaponIndex: 0, y2: 0, zIndex: 0 },
     plan: { fire: false, movDir: undefined, bullX: 0, bullY: 0 },
@@ -2746,6 +2865,8 @@ function dOTPlan(player, primary, reach, moreGold, proj, fireHat, fireWeapon) {
         else velocity.stepUnit(player, dOT.fanUx[f], dOT.fanUy[f], dOT.turretL, dOT.simTurret, config.timeBetweenTick);
         var sc = dOTFireCheck(player, player.tailIndex, dOT.simTurret, primary, reach, moreGold, proj);
         if (sc < dOT.fireMargin) continue;
+        if (pathBlocker(player.x2, player.y2, dOT.simTurret.x2, dOT.simTurret.y2)) continue;
+        if (pathBlocker(dOT.simTurret.x2, dOT.simTurret.y2, dOT.plan.bullX, dOT.plan.bullY)) continue;
         if (!found || sc > best) { found = true; best = sc; bestDir = f < 0 ? undefined : f * Math.PI * 2 / dOT.fireFan; }
     }
     if (!found) return null;
@@ -2843,6 +2964,7 @@ class DynamicOneTick {
         var nearestEnemy = combatIntel.nearestEnemy;
         if (nearestEnemy === null) return;
         if (!canOneTick) return;
+        if (teleporterOnPath(player.x2, player.y2, nearestEnemy.x2, nearestEnemy.y2)) { this.#autoMoving = false; return; }
         var rangedId = dOTRangedId(player);
         var bow = rangedId !== 0;
         if (!bow && !combatManager.canPurchase(0, 53)) return;
@@ -2853,7 +2975,7 @@ class DynamicOneTick {
 
         var proj = dOTProjectEnemy(nearestEnemy);
         var myRank = player.leaderboard || Infinity, enemyRank = nearestEnemy.leaderboard || Infinity;
-        var moreGold = (myRank !== Infinity || enemyRank !== Infinity) ? myRank <= enemyRank : nearestEnemy.dOTMeFirst !== false;
+        var moreGold = updatesFirst(player, nearestEnemy);
         var reach = combatManager.weaponReach(nearestEnemy, primary);
         var fireHat = bow ? player.skinIndex : 53, fireWeapon = bow ? rangedId : player.weaponIndex;
         var wdE = Math.hypot(nearestEnemy.x2 - player.x2, nearestEnemy.y2 - player.y2);
@@ -2863,12 +2985,15 @@ class DynamicOneTick {
             combatManager.sentAccEquip = true;
         }
 
-        var futureX = player.x2 + (player.vx || 0), futureY = player.y2 + (player.vy || 0);
-        var futureBallDist = Math.hypot(futureX - nearestEnemy.x2, futureY - nearestEnemy.y2) - 35;
-        var closingIn = futureBallDist < wdE - 35;
-        if (closingIn && futureBallDist >= dOT.winLo && futureBallDist <= dOT.winHi) this.#autoMoving = true;
-        if (this.#autoMoving && (!closingIn || wdE - 35 < dOT.winLo)) this.#autoMoving = false;
-        if (this.#autoMoving) combatManager.moveTo = Math.atan2(nearestEnemy.y2 - player.y2, nearestEnemy.x2 - player.x2);
+        var toEnemy = Math.atan2(nearestEnemy.y2 - player.y2, nearestEnemy.x2 - player.x2);
+        var stepOne = dOT.simApproach[0], stepTwo = dOT.simApproach[1];
+        dOTStepSelf(player, toEnemy, player, stepOne);
+        dOTStepSelf(stepOne, toEnemy, player, stepTwo);
+        var settleDist = Math.hypot(stepTwo.x2 - proj[1].x2, stepTwo.y2 - proj[1].y2) - 35;
+        var closingIn = settleDist < wdE - 35;
+        if (closingIn && settleDist >= dOT.winLo && settleDist <= dOT.winHi) this.#autoMoving = true;
+        if (this.#autoMoving && (!closingIn || settleDist < dOT.winLo)) this.#autoMoving = false;
+        if (this.#autoMoving) combatManager.moveTo = toEnemy;
 
         var ring = dOTRing(player, primary, reach, moreGold, fireHat, fireWeapon);
         if (ring !== null) {
@@ -3644,48 +3769,63 @@ class KnockIntoTrap {
 }
 
 
-class AutoSync {
+class MeleeSync {
 
-    action_id = "Auto Sync";
+    action_id = "Melee Sync";
     useTurret = false;
+
+    #selfReady(player, enemy) {
+        if (enemy === null || combatIntel.shouldIgnoreAction()) return false;
+        var primary = player.weapons[0];
+        if (primary == null || !items.weapons[primary]) return false;
+        if (!weaponReloads.isReloaded(player, 0)) return false;
+        if (combatIntel.shieldBlocking(enemy, player)) return false;
+        return nearVelocity(player, enemy, combatManager.weaponReach(enemy, primary));
+    }
+
+    #partner(enemy) {
+        if (config.tick - syncSignal.tick > 1) return null;
+        if (syncSignal.partnerSID == null || syncSignal.targetSID !== enemy.sid) return null;
+        if (!isAlly(syncSignal.partnerSID)) return null;
+        var mate = findPlayerBySID(syncSignal.partnerSID);
+        return (mate && mate !== combatManager.player) ? mate : null;
+    }
 
     update() {
         var player = combatManager.player;
-        if (combatManager.active || combatIntel.shouldIgnoreAction()) { this.useTurret = false; return; }
+        if (!combatManager.syncToggle) { this.useTurret = false; return; }
         var nearestEnemy = combatIntel.nearestEnemy;
-        var other = combatIntel.nearestEnemyToNearestEnemy;
-        if (nearestEnemy === null || other === null) return;
         var turretReloaded = combatManager.ownsItem(0, 53) && weaponReloads.isReloaded(player, 2);
         if (this.useTurret) {
             this.useTurret = false;
-            if (turretReloaded) { combatManager.active = true; combatManager.forceHat = 53; }
+            if (turretReloaded && !combatIntel.shouldIgnoreAction()) { combatManager.active = true; combatManager.forceHat = 53; }
             return;
         }
+        var ready = this.#selfReady(player, nearestEnemy);
+        relay.publishSync(nearestEnemy ? nearestEnemy.sid : null, ready);
+        if (combatManager.active || nearestEnemy === null) return;
+        if (!ready) { combatManager.forceWeapon = 0; return; }
+        var other = this.#partner(nearestEnemy);
+        if (other === null) return;
         var primary1 = player.weapons[0];
         var primary2 = other.primary;
         if (primary2 == null || !items.weapons[primary2]) return;
         var primaryDamage1 = combatIntel.maxWeaponDmg(player, primary1, false, false);
         var primaryDamage2 = combatIntel.maxWeaponDmg(other, primary2, false, false);
         if ((primaryDamage1 + primaryDamage2) * 0.75 < 100) return;
-        var range1 = combatManager.weaponReach(nearestEnemy, primary1);
-        var range2 = items.weapons[primary2].range + hitScale(nearestEnemy);
-        if (!combatIntel.near(player, nearestEnemy, range1) || !combatIntel.near(other, nearestEnemy, range2)) return;
-        var isReloaded1 = weaponReloads.isReloaded(player, 0);
-        var isReloaded2 = weaponReloads.isReloaded(other, 0);
+        if (!nearVelocity(other, nearestEnemy, items.weapons[primary2].range + hitScale(nearestEnemy))) return;
+        if (!weaponReloads.isReloaded(other, 0)) return;
         var fx = nearestEnemy.predicted ? nearestEnemy.predicted.likely.x : nearestEnemy.x2;
         var fy = nearestEnemy.predicted ? nearestEnemy.predicted.likely.y : nearestEnemy.y2;
         var pfx = player.predicted ? player.predicted.likely.x : player.x2;
         var pfy = player.predicted ? player.predicted.likely.y : player.y2;
         var angleToEnemy = Math.atan2(fy - pfy, fx - pfx);
-        if (!isReloaded1) combatManager.forceWeapon = 0;
-        if (isReloaded1 && isReloaded2) {
-            combatManager.active = true;
-            combatManager.bestAim = angleToEnemy;
-            combatManager.lockEquip(7, combatManager.attackAcc());
-            combatManager.swingWeapon(0, angleToEnemy);
-            combatManager.releaseAttack();
-            this.useTurret = true;
-        }
+        combatManager.active = true;
+        combatManager.bestAim = angleToEnemy;
+        combatManager.lockEquip(7, combatManager.attackAcc());
+        combatManager.swingWeapon(0, angleToEnemy);
+        combatManager.releaseAttack();
+        this.useTurret = true;
     }
 }
 
@@ -5236,7 +5376,7 @@ class AutoPush {
         if (combatManager.moveTo != null || combatIntel.pushing) return;
         if (combatManager.retrapPositioning) {
             var rp = combatManager.retrapPositioning;
-            if (this.retrapPathClear(me, rp.gx, rp.gy)) {
+            if (!pathBlocker(me.x2, me.y2, rp.gx, rp.gy)) {
                 var en = rp.enemy, tr = rp.trap;
                 var placeScale = combatManager.itemPlaceScale(me, items.list[rp.id]);
                 var etx = en.x2 - tr.x, ety = en.y2 - tr.y, locked = etx * etx + ety * ety <= 45 * 45;
@@ -5378,17 +5518,6 @@ class AutoPush {
         return out;
     }
 
-    retrapPathClear(player, gx, gy) {
-        var objs = objectManager.nearObjects, n = objectManager.nearObjectCount;
-        for (var i = 0; i < n; i++) {
-            var o = objs[i];
-            if (!o || !o.active) continue;
-            if (o.trap && o.owner && isAlly(o.owner.sid)) continue;
-            var rad = objSpikeScale(o) + config.playerScale;
-            if (segHitsCircle(player.x2, player.y2, gx, gy, o.x, o.y, rad)) return false;
-        }
-        return true;
-    }
 }
 
 
@@ -5457,6 +5586,7 @@ class AutoFarm {
         if (this.farmPendingTick >= 0 && config.tick - this.farmPendingTick >= 3) {
             this.farmToggle = !this.farmToggle;
             this.farmPendingTick = -100;
+            if (this.farmToggle) resyncBullTick = false;
         }
         if (!this.farmToggle) return;
         var player = combatManager.player;
@@ -5836,7 +5966,7 @@ function connectSocketIfReady() {
     if (isProd && !turnstileToken) return;
     startedConnecting = true;
 
-    addLog(null, 'Tailwind v10 (2026.07.19)', null, true);
+    addLog(null, 'Tailwind [v11, 2026.07.21]', null, true);
 
     connectSocket(isProd ? "cf:" + turnstileToken : null);
 }
@@ -5974,6 +6104,7 @@ function follmoo() {
         saveVal("moofoll", 1);
     }
 }
+follmoo();
 var useNativeResolution;
 var pixelDensity = 1;
 var delta, now, lastSent;
@@ -6153,7 +6284,7 @@ combatManager.actions.push(
     new SpikeKnockTrap(),
     new KnockIntoTrap(),
     new BreakPunish(),
-    new AutoSync(),
+    new MeleeSync(),
     new TurretSync(),
     new SpikeSync(),
     new SpikeSyncHammer(),
@@ -6178,7 +6309,6 @@ var autoOffenseActions = new Set([
     "Spike Knock Trap",
     "Knock Into Trap",
     "Break Punish",
-    "Auto Sync",
     "Projectile Sync",
     "Spike Sync",
     "Spike Sync Hammer",
@@ -6191,15 +6321,23 @@ offenseActions.add("Instakill");
 offenseActions.add("Reverse Insta");
 offenseActions.add("Bow Insta");
 offenseActions.add("Dynamic OneTick");
+offenseActions.add("Melee Sync");
 
 var settings = {
-    combat:  { instakill: true, reverseInsta: true, bowInsta: false, dynamicOneTick: true, katanaInsta: true, knockbackInsta: true, knockbackHammerInsta: true, spikeTick: true, knockbackTrap: true, knockIntoTrap: true, plagueHit: true, breakPunish: true, autoSync: true, turretSync: true, spikeSync: true, spikeSyncHammer: true, bleedInsta: true, appleInsta: true, autoPush: true, pushMode: "ppo" },
+    combat:  { instakill: true, reverseInsta: true, bowInsta: false, dynamicOneTick: true, katanaInsta: true, knockbackInsta: true, knockbackHammerInsta: true, spikeTick: true, knockbackTrap: true, knockIntoTrap: true, plagueHit: true, breakPunish: false, meleeSync: true, turretSync: true, spikeSync: false, spikeSyncHammer: true, bleedInsta: true, appleInsta: true, autoPush: true, pushMode: "ppo" },
     defense: { autoHeal: true, autoPlace: true, safeWalk: true, autoBreak: true, preRetrap: true, placementDefense: true, shameLeak: true, retrapMove: true },
-    visuals: { placeGhosts: true, threatBar: true, reticles: true, vectors: true, hitMarkers: true, hudBars: false, lbPanel: true, chatLog: true,
+    visuals: { placeGhosts: true, placeLines: false, threatBar: true, reticles: true, vectors: true, hitMarkers: true, hudBars: false, lbPanel: true, chatLog: true, packetLogs: false,
               playerSids: true, sidRadar: true, shameText: true, healInfo: true, reloadBars: false, hpText: false, turretArc: true, turretBar: true, nameStyle: true, uiMetrics: true, darkOutlines: true, barStyle: true, dmgText: true, nightTint: true, chunkGrid: true, treeReveal: true, enemySpikeTint: true, buildDepth: true, biomeMinimap: true, brokenMarkers: true, deathGhost: false, deathShatter: true, kbGhost: true, kbLanding: true, itemCounters: true, feedbackText: true, cameraFollow: false, staticMills: true, customMenus: true, trapGhosts: true, advancedStats: true, ae86Aim: false },
     misc:    { defaultHat: true, defaultAcc: true, utilityHat: true, autoReload: true, autoBuy: true }
 };
 var settingsDefaults = JSON.parse(JSON.stringify(settings));
+var tailwindVersion = "[v11, 2026.07.21]";
+if (getSavedVal("tailwindVersion") !== tailwindVersion) {
+    deleteVal("settings");
+    deleteVal("keybinds");
+    deleteVal("texturePack");
+    saveVal("tailwindVersion", tailwindVersion);
+}
 (function() {
     var saved = getSavedVal("settings");
     if (!saved) return;
@@ -6222,7 +6360,7 @@ var settingsMeta = {
         knockIntoTrap:        "Knock Into Trap",
         plagueHit:            "Plague Hit",
         breakPunish:          "Break Punish",
-        autoSync:             "Auto Sync",
+        meleeSync:            "Melee Sync",
         turretSync:           "Projectile Sync",
         spikeSync:            "Spike Sync",
         spikeSyncHammer:      "Spike Sync Hammer",
@@ -6249,6 +6387,7 @@ var settingsMeta = {
     } },
     visuals: { title: "Visuals", items: {
         placeGhosts: "Placement Ghosts",
+        placeLines:  "Placement Lines",
         threatBar:   "Threat Bar",
         reticles:    "Target Reticles",
         vectors:     "Auto Push Markers",
@@ -6256,6 +6395,7 @@ var settingsMeta = {
         hudBars:     "HUD Bars",
         lbPanel:     "Leaderboard Panel",
         chatLog:     "Chat Log",
+        packetLogs:  "Packet Logs",
         playerSids:  "Player SIDs",
         sidRadar:    "SID Radar",
         shameText:   "Shame Counter",
@@ -6300,6 +6440,7 @@ var settingsMeta = {
         ["@shift", "force-stop auto push / safe walk"],
         ["@insta", "instakill toggle"],
         ["@dynamicOneTick", "onetick toggle"],
+        ["@sync", "sync toggle"],
         ["@heal", "fast heal"],
         ["@spike", "spike"],
         ["@trap", "boost pad / trap"],
@@ -6324,7 +6465,7 @@ var settingGate = {
     "Spike Knock Trap": ["combat", "knockbackTrap"],
     "Knock Into Trap": ["combat", "knockIntoTrap"],
     "Break Punish": ["combat", "breakPunish"],
-    "Auto Sync": ["combat", "autoSync"],
+    "Melee Sync": ["combat", "meleeSync"],
     "Projectile Sync": ["combat", "turretSync"],
     "Spike Sync": ["combat", "spikeSync"],
     "Spike Sync Hammer": ["combat", "spikeSyncHammer"],
@@ -6350,6 +6491,7 @@ var crownPadY = -3;
 function applyVisualToggles() {
     var v = settings.visuals;
     if (_chatLog && inGame) _chatLog.style.display = v.chatLog ? "flex" : "none";
+    if (packetLog) packetLog.style.display = v.packetLogs ? "flex" : "none";
     if (lbPanel) lbPanel.style.display = v.lbPanel ? "" : "none";
     if (lbPanelSep) lbPanelSep.style.display = v.lbPanel ? "" : "none";
     if (biomeImage) biomeImage.style.display = v.biomeMinimap ? "" : "none";
@@ -6949,7 +7091,7 @@ function updateStoreItems(type, id, index) {
     } else {
         if (!type) {
             player.skins[id] = 1;
-            if (id === 7 && !resyncBullTick && (!combatIntel.nearestEnemy || combatIntel.nearestEnemy.distanceToMe > 300)) { resyncBullTick = true; logPlayerEvent("Resyncing Bull Tick at T." + config.tick, "#e8a33d"); }
+            if (id === 7 && !resyncBullTick && !autoFarm.farmToggle && (!combatIntel.nearestEnemy || combatIntel.nearestEnemy.distanceToMe > 300)) { resyncBullTick = true; logPlayerEvent("Resyncing Bull Tick at T." + config.tick, "#e8a33d"); }
         } else
             player.skinIndex = id;
     }
@@ -7699,7 +7841,7 @@ var moveKeys = {
 };
 var keyBindDefaults = {
     lmb: "M0", rmb: "M2", space: "K32", shift: "K16",
-    insta: "K82", dynamicOneTick: "K71",
+    insta: "K82", dynamicOneTick: "K71", sync: "K84",
     heal: "K81", wall: "K52", spike: "K86", trap: "K70", turret: "K72", spawn: "K77",
     mills: "K78", gather: "K69", lockRot: "K88", zoomReset: "K80"
 };
@@ -7776,6 +7918,13 @@ function keysActive() {
 function flashText(life, msg) {
     if (settings.visuals.feedbackText && player) textManager.showText(player.x, player.y, 19, 0.1, life, msg, "#fff", null, 8);
 }
+var manualToggles = ["instaToggle", "oneTickToggle", "syncToggle"];
+function otherToggleOn(except) {
+    for (var i = 0; i < manualToggles.length; ++i) {
+        if (manualToggles[i] !== except && combatManager[manualToggles[i]]) return true;
+    }
+    return false;
+}
 function bindPress(id) {
     var g = placeBindGroups[id];
     if (g !== undefined) {
@@ -7789,14 +7938,21 @@ function bindPress(id) {
         if (autoWindmills.toggle) autoWindmills.stable();
         else autoWindmills.toggle = 1;
     } else if (id === "insta") {
-        if (combatManager.oneTickToggle) {
+        if (otherToggleOn("instaToggle")) {
             flashText(675, "disable other toggle first");
         } else {
             combatManager.instaToggle = !combatManager.instaToggle;
             flashText(600, combatManager.instaToggle ? "instakill on" : "instakill off");
         }
+    } else if (id === "sync") {
+        if (otherToggleOn("syncToggle")) {
+            flashText(675, "disable other toggle first");
+        } else {
+            combatManager.syncToggle = !combatManager.syncToggle;
+            flashText(600, combatManager.syncToggle ? "sync on" : "sync off");
+        }
     } else if (id === "dynamicOneTick") {
-        if (combatManager.instaToggle) {
+        if (otherToggleOn("oneTickToggle")) {
             flashText(675, "disable other toggle first");
         } else if (!combatManager.oneTickToggle && player.weapons[0] !== 5) {
             flashText(675, "need polearm");
@@ -8012,7 +8168,7 @@ function flushTextBuffer() {
         pp.stackDmg = -1;
     }
     textStore.forEach(function(e) {
-        var color = e.isHeal ? (settings.visuals.uiMetrics ? "#7bb343" : "#8ecc51") : (e.target.isPlayer ? customColor(e.target.sid) : "#fff");
+        var color = e.isHeal ? (settings.visuals.uiMetrics ? "#7A9874" : "#8ecc51") : (e.target.isPlayer ? customColor(e.target.sid) : "#fff");
         textManager.showText(e.x, e.y, 50, 0.15, 800, Math.round(e.sum), color, "Lilita One");
     });
     textStore.clear();
@@ -8029,7 +8185,7 @@ function flushTextBuffer() {
     }
     for (var m = 0; m < groups.length; ++m) {
         var grp = groups[m];
-        textManager.showText(grp.x, grp.y, 50, 0.15, 800, Math.round(grp.sum), grp.isHeal ? (settings.visuals.uiMetrics ? "#7bb343" : "#8ecc51") : "#fff", "Lilita One");
+        textManager.showText(grp.x, grp.y, 50, 0.15, 800, Math.round(grp.sum), grp.isHeal ? (settings.visuals.uiMetrics ? "#7A9874" : "#8ecc51") : "#fff", "Lilita One");
     }
     textLoose.length = 0;
 }
@@ -8568,6 +8724,7 @@ function updateGame() {
 
         renderInstaTarget(mainContext, xOffset, yOffset);
         renderOneTickTarget(mainContext, xOffset, yOffset);
+        renderSyncTarget(mainContext, xOffset, yOffset);
         renderAutoComboTarget(mainContext, xOffset, yOffset);
         renderPushVector(mainContext, xOffset, yOffset);
         renderKbLanding(mainContext, xOffset, yOffset);
@@ -8703,12 +8860,12 @@ function updateGame() {
                         }
                         if (settings.visuals.hpText && tmpObj.isPlayer) {
                             mainContext.save();
-                            mainContext.font = "12.5px Lilita One";
+                            mainContext.font = "11.5px Lilita One";
                             mainContext.textBaseline = "middle";
                             mainContext.textAlign = "left";
                             mainContext.lineWidth = 6;
                             mainContext.strokeStyle = darkOutlineColor;
-                            var offset = tmpObj.turretBarVisible ? 31 : 21.5;
+                            var offset = tmpObj.turretBarVisible ? 30.5 : 21;
                             var hpY = (tmpObj.y - yOffset + tmpObj.scale) + config.nameY + offset;
                             var text = "H:" + tmpObj.health.toFixed(2) + "/100.00";
                             var hpM = mainContext.measureText(text);
@@ -8753,7 +8910,7 @@ function updateGame() {
                             tmpObj.turretBarVisible = false;
                             var turretReady = turretReload.current >= turretReload.max;
                             var turretRatio = Math.min(1, turretReload.current / turretReload.max);
-                            var reticleOnThis = inGame && player.alive && autoComboVisual === tmpObj && !combatManager.instaToggle && !combatManager.oneTickToggle && (config.tick - autoComboFresh <= acReticleVTicks) && tmpObj.visible;
+                            var reticleOnThis = inGame && player.alive && autoComboVisual === tmpObj && !combatManager.instaToggle && !combatManager.oneTickToggle && !combatManager.syncToggle && (config.tick - autoComboFresh <= acReticleVTicks) && tmpObj.visible;
                             if (tmpObj._previousTurretCur != null && turretReload.current < tmpObj._previousTurretCur) tmpObj.turretBarLatch = reticleOnThis;
                             else if (reticleOnThis) tmpObj.turretBarLatch = true;
                             tmpObj._previousTurretCur = turretReload.current;
@@ -9152,10 +9309,18 @@ function renderInstaTarget(ctx, xOffset, yOffset) {
     drawTargetReticle(ctx, t, xOffset, yOffset, "#b00000", true);
 }
 
+function renderSyncTarget(ctx, xOffset, yOffset) {
+    if (!settings.visuals.reticles) return;
+    if (!inGame || !player || !player.alive || !combatManager.syncToggle) return;
+    var t = combatIntel.nearestEnemy;
+    if (!t || !t.visible) return;
+    drawTargetReticle(ctx, t, xOffset, yOffset, "#b57edc", true);
+}
+
 function renderAutoComboTarget(ctx, xOffset, yOffset) {
     if (!settings.visuals.reticles) return;
     if (!inGame || !player || !player.alive) return;
-    if (combatManager.instaToggle || combatManager.oneTickToggle) return;
+    if (combatManager.instaToggle || combatManager.oneTickToggle || combatManager.syncToggle) return;
     if (!autoComboVisual || config.tick - autoComboFresh > acReticleVTicks) { autoComboVisual = null; return; }
     var t = autoComboVisual;
     if (!t.visible) return;
@@ -9173,8 +9338,7 @@ function renderOneTickTarget(ctx, xOffset, yOffset) {
     var rangedId = dOTRangedId(player);
     var bow = rangedId !== 0;
     if (bow) { var rt = dOTRangedProj(rangedId).speed * config.timeBetweenTick; dOT.winLo = rt - 35 + 43.5; dOT.winHi = 2 * rt - 35; } else { dOT.winLo = 175; dOT.winHi = 298; }
-    var myRank = player.leaderboard || Infinity, enemyRank = t.leaderboard || Infinity;
-    var moreGold = (myRank !== Infinity || enemyRank !== Infinity) ? myRank <= enemyRank : t.dOTMeFirst !== false;
+    var moreGold = updatesFirst(player, t);
     var ring = dOTRing(player, primary, reach, moreGold, bow ? player.skinIndex : 53, bow ? rangedId : player.weaponIndex);
     var loD = ring ? ring.lo : 205, hiD = ring ? ring.hi : 229;
     var minX = t.x2 + Math.cos(ang) * loD, minY = t.y2 + Math.sin(ang) * loD;
@@ -9253,7 +9417,7 @@ function renderOneTickTarget(ctx, xOffset, yOffset) {
 }
 
 function renderAutoPlace(ctx, xOffset, yOffset) {
-    if (!settings.visuals.placeGhosts) return;
+    if (!settings.visuals.placeLines) return;
     if (!inGame || !player || !player.alive) return;
     var pg = autoPlace.placeGradeData();
     if (pg.quadMode) return;
@@ -9267,7 +9431,7 @@ function renderAutoPlace(ctx, xOffset, yOffset) {
 
     for (var ci = 0; ci < chosen.length; ++ci) {
         var cand = chosen[ci];
-        if (cand.syncGhost || autoPlace.ghostSuppressed(cand.x, cand.y, cand.scale)) continue;
+        if (cand.syncGhost) continue;
         var px = cand.x - xOffset, py = cand.y - yOffset;
         var ccolor = placeGradeColors[cand.analytic] || "#808080";
         drawWhyLine(ctx, cand, px, py, ccolor, xOffset, yOffset);
@@ -9305,7 +9469,7 @@ function renderPlaceChips(ctx, xOffset, yOffset) {
     if (!chosen || chosen.length === 0) return;
     for (var ci = 0; ci < chosen.length; ++ci) {
         var cand = chosen[ci];
-        if (cand.syncGhost || autoPlace.ghostSuppressed(cand.x, cand.y, cand.scale)) continue;
+        if (cand.syncGhost) continue;
         var px = cand.x - xOffset, py = cand.y - yOffset;
         var ccolor = placeGradeColors[cand.analytic] || "#808080";
         drawChip(ctx, px, py, cand.scale + 2, cand.preplace ? "p" : cand.points.toFixed(1), ccolor);
@@ -11054,9 +11218,10 @@ function place(id, dir = getAttackDir()) {
 
 function updatePlayers(data) {
     config.tick++;
+    if (config.tick % 9 === 0) config.packets = 0;
     if (resyncArmTick && config.tick >= resyncArmTick) {
         resyncArmTick = 0;
-        if (inGame && player && player.alive && combatManager.ownsItem(0, 7) && !resyncBullTick && (!combatIntel.nearestEnemy || combatIntel.nearestEnemy.distanceToMe > 300)) { resyncBullTick = true; logPlayerEvent("Resyncing Bull Tick at T." + config.tick, "#e8a33d"); }
+        if (inGame && player && player.alive && combatManager.ownsItem(0, 7) && !resyncBullTick && !autoFarm.farmToggle && (!combatIntel.nearestEnemy || combatIntel.nearestEnemy.distanceToMe > 300)) { resyncBullTick = true; logPlayerEvent("Resyncing Bull Tick at T." + config.tick, "#e8a33d"); }
     }
     flushTextBuffer();
     advanceFakeGhosts();
@@ -11143,7 +11308,7 @@ function updatePlayers(data) {
                 }
             }
         }
-        if (!attackState.attacking && combatManager.attackHeld) combatManager.releaseAttack();
+        if (!attackState.attacking && combatManager.attackHeld && combatIntel.trapMeltDamage <= 0) combatManager.releaseAttack();
 
         if (combatManager.swBreak) swBreakTick = config.tick;
         var swText = null;
@@ -11474,7 +11639,7 @@ function refreshInvSprites() {
     refreshInvSprites();
     refreshInventory();
 })();
-var messageContainer = null, _chatInput = null, _chatLog = null, lastChatKeys = [];
+var messageContainer = null, _chatInput = null, _chatLog = null, packetLog = null, lastChatKeys = [];
 function chatTime() {
     var now = new Date();
     var period = now.getHours() >= 12 ? "PM" : "AM";
@@ -11528,6 +11693,31 @@ function wireLogDelete(div) {
         if (del) del.remove();
     });
 }
+function addWSLog(name, text, mine) {
+    if (!messageContainer) return;
+    var div = document.createElement("div");
+    div.className = "logMessage";
+    var time = document.createElement("span");
+    time.className = "darken";
+    time.innerHTML = chatTime();
+    var tag = document.createElement("span");
+    tag.style.color = "#6cc3f2";
+    tag.textContent = "[WS] ";
+    div.append(time, tag);
+    if (name) {
+        var nameSpan = document.createElement("span");
+        nameSpan.style.color = mine ? "#89c562" : "#e8a33d";
+        nameSpan.textContent = name + ": ";
+        div.appendChild(nameSpan);
+    }
+    var body = document.createElement("span");
+    body.className = "messageContent";
+    body.textContent = text;
+    div.appendChild(body);
+    wireLogDelete(div);
+    messageContainer.appendChild(div);
+    messageContainer.scrollTop = messageContainer.scrollHeight;
+}
 function logPlayerEvent(text, color) {
     if (!messageContainer) return;
     var div = document.createElement("div");
@@ -11556,10 +11746,25 @@ function logOffenseAction(id, target) {
     lastOffenseLogId = id; lastOffenseLogTick = config.tick;
     logPlayerEvent(id + " on " + (target ? nameTag(target.name, target.sid, target.team) : "unknown") + " at T." + config.tick, "#c4a7e7");
 }
+function recordPacket(type, args) {
+    if (!packetLog || !settings.visuals.packetLogs || !inGame) return;
+    var line = document.createElement("div");
+    line.className = "packetLine";
+    var parts = [];
+    for (var i = 0; i < args.length; ++i) {
+        var a = args[i];
+        parts.push(typeof a === "object" ? JSON.stringify(a) : String(a));
+    }
+    line.textContent = '["' + type + '", [' + parts.join(", ") + ']]';
+    line.style.color = customColors[Math.floor(Math.random() * customColors.length)];
+    packetLog.appendChild(line);
+    while (packetLog.childNodes.length > 20) packetLog.removeChild(packetLog.firstChild);
+    setTimeout(function() { if (line.parentNode === packetLog) packetLog.removeChild(line); }, 1000);
+}
 (function() {
     var container = document.createElement("div");
     container.id = "chatLog";
-    container.innerHTML = '<div id="messageContainer"></div><input id="chatInput" class="chat-input" type="text" maxlength="100" placeholder="To chat click here or press enter">';
+    container.innerHTML = '<div id="messageContainer"></div><input id="chatInput" class="chat-input" type="text" maxlength="100" placeholder="To access private chat click here">';
     document.body.appendChild(container);
     _chatLog = container;
     _chatLog.style.display = "none";
@@ -11570,7 +11775,7 @@ function logOffenseAction(id, target) {
         if (e.code === "Enter") {
             e.preventDefault();
             var v = _chatInput.value.trim();
-            if (v.length > 0) sendChat(v);
+            if (v.length > 0) relay.say(v);
             _chatInput.value = "";
         } else if (e.code === "Escape") {
             _chatInput.blur();
@@ -11580,6 +11785,10 @@ function logOffenseAction(id, target) {
         e.stopPropagation();
         if (e.code === "Enter") _chatInput.blur();
     });
+    packetLog = document.createElement("div");
+    packetLog.id = "packetLog";
+    document.body.appendChild(packetLog);
+    packetLog.style.display = "none";
 })();
 var ptPing = 0, ptPps = -100, ptFps = -100, ptTick = -100;
 var tpsLastTick = 0, tpsLastMs = 0, tpsVal = 0;
