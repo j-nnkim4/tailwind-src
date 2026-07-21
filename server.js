@@ -7,6 +7,7 @@ var port = process.env.PORT || 3000;
 var maxText = 300;
 var maxName = 32;
 var heartbeat = 30000;
+var syncStale = 250;
 
 var clients = new Map();
 
@@ -82,6 +83,32 @@ wss.on("connection", function(socket) {
             clients.forEach(function(c) { send(c.socket, out); });
             return;
         }
+
+        if (msg.t === "sync") {
+            entry.sync = {
+                server: clean(msg.server, 64),
+                sid: msg.sid,
+                target: msg.target,
+                armed: !!msg.armed,
+                at: Date.now()
+            };
+            if (!entry.sync.armed || entry.sync.target == null || entry.sync.sid == null) return;
+            var mate = null;
+            clients.forEach(function(c, cid) {
+                if (mate || cid === socket.clientId) return;
+                var o = c.sync;
+                if (!o || !o.armed || o.target == null || o.sid == null) return;
+                if (o.server !== entry.sync.server || o.target !== entry.sync.target) return;
+                if (Date.now() - o.at > syncStale) return;
+                mate = c;
+            });
+            if (!mate) return;
+            send(socket, { t: "fire", partner: mate.sync.sid, target: entry.sync.target });
+            send(mate.socket, { t: "fire", partner: entry.sync.sid, target: entry.sync.target });
+            entry.sync.armed = false;
+            mate.sync.armed = false;
+            return;
+        }
     });
 
     socket.on("close", function() {
@@ -105,6 +132,4 @@ var beat = setInterval(function() {
 
 wss.on("close", function() { clearInterval(beat); });
 
-server.listen(port, "0.0.0.0", function() {
-    console.log("chat relay listening on " + port);
-});
+server.listen(port, "0.0.0.0");
