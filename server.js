@@ -89,10 +89,10 @@ wss.on("connection", function(socket) {
             return;
         }
 
-        if (msg.t === "troll") {
-            if (msg.target == null) return;
-            var trollOut = { t: "troll", target: msg.target, on: !!msg.on };
-            clients.forEach(function(c) { send(c.socket, trollOut); });
+        if (msg.t === "enemies") {
+            if (!Array.isArray(msg.list)) return;
+            var enemiesOut = { t: "enemies", list: msg.list.slice(0, 60) };
+            clients.forEach(function(c, cid) { if (cid !== socket.clientId) send(c.socket, enemiesOut); });
             return;
         }
 
