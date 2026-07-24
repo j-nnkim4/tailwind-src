@@ -53,6 +53,11 @@ wss.on("connection", function(socket) {
         try { msg = JSON.parse(raw); } catch (e) { return; }
         if (!msg || typeof msg.t !== "string") return;
 
+        if (msg.t === "time") {
+            send(socket, { t: "time", c: msg.c });
+            return;
+        }
+
         if (msg.t === "registration") {
             var id = clean(msg.id, 64);
             var name = clean(msg.name, maxName) || "anon";
