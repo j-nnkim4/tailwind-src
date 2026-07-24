@@ -89,6 +89,13 @@ wss.on("connection", function(socket) {
             return;
         }
 
+        if (msg.t === "troll") {
+            if (msg.target == null) return;
+            var trollOut = { t: "troll", target: msg.target, on: !!msg.on };
+            clients.forEach(function(c) { send(c.socket, trollOut); });
+            return;
+        }
+
         if (msg.t === "sync") {
             entry.sync = {
                 server: clean(msg.server, 64),
