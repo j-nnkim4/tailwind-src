@@ -9,7 +9,9 @@ function findMiddleAngle(a, b) {
 
 var isProd = location.hostname !== "localhost" && location.hostname !== "127.0.0.1" && !location.hostname.startsWith("192.168.");
 
-var syncSignal = { tick: -100, partnerSID: null, targetSID: null };
+var syncSignal = { tick: -100, partnerSID: null, targetSID: null, arriveAt: 0 };
+var meleeSyncAction = null;
+
 
 function gameServerKey() {
     var m = /server=([^&]+)/.exec(location.search);
@@ -23,13 +25,16 @@ class Relay {
     #retryDelay = 1000;
     #id = null;
     #sentName = null;
+    #oneWayRelay = 40;
+    #rttSamples = [];
+    #timeTimer = null;
 
     identity() {
         if (this.#id) return this.#id;
-        try { this.#id = localStorage.getItem("tailwindWSID"); } catch (e) {}
+        try { this.#id = sessionStorage.getItem("tailwindWSID"); } catch (e) {}
         if (!this.#id) {
             this.#id = "u" + Date.now().toString(36) + Math.random().toString(36).slice(2, 10);
-            try { localStorage.setItem("tailwindWSID", this.#id); } catch (e) {}
+            try { sessionStorage.setItem("tailwindWSID", this.#id); } catch (e) {}
         }
         return this.#id;
     }
@@ -37,9 +42,9 @@ class Relay {
     connect() {
         if (this.#socket && (this.#socket.readyState === 0 || this.#socket.readyState === 1)) return;
         try { this.#socket = new WebSocket(this.#url); } catch (e) { this.#retry(); return; }
-        this.#socket.onopen = () => { this.#retryDelay = 1000; this.#register(); };
+        this.#socket.onopen = () => { this.#retryDelay = 1000; this.#register(); this.#startClock(); };
         this.#socket.onmessage = (e) => this.#receive(e.data);
-        this.#socket.onclose = () => this.#retry();
+        this.#socket.onclose = () => { if (this.#timeTimer) { clearInterval(this.#timeTimer); this.#timeTimer = null; } this.#retry(); };
         this.#socket.onerror = () => {};
     }
 
@@ -57,17 +62,35 @@ class Relay {
         this.send({ t: "sync", server: gameServerKey(), sid: player.sid, target: targetSID, armed: armed });
     }
 
+    sendEnemies(list) {
+        this.send({ t: "enemies", list: list });
+    }
+
     #isOpen() {
         return !!this.#socket && this.#socket.readyState === 1;
     }
 
     #name() {
-        return (player && player.name) || "anon";
+        return (inGame && player && player.name) ? player.name : null;
     }
 
     #register() {
-        this.#sentName = this.#name();
-        this.send({ t: "registration", id: this.identity(), name: this.#sentName });
+        var n = this.#name();
+        if (!n || n === this.#sentName) return;
+        this.#sentName = n;
+        this.send({ t: "registration", id: this.identity(), name: n });
+    }
+
+    announce() { this.#register(); }
+
+    #startClock() {
+        this.#syncClock();
+        if (this.#timeTimer) clearInterval(this.#timeTimer);
+        this.#timeTimer = setInterval(() => this.#syncClock(), 4000);
+    }
+
+    #syncClock() {
+        if (this.#isOpen() && this.#sentName) this.send({ t: "time", c: Date.now() });
     }
 
     #retry() {
@@ -80,9 +103,24 @@ class Relay {
         var msg;
         try { msg = JSON.parse(raw); } catch (e) { return; }
         if (msg.t === "say") addWSLog(msg.name, msg.text, msg.from === this.identity());
-        else if (msg.t === "fire") { syncSignal.tick = config.tick; syncSignal.partnerSID = msg.partner; syncSignal.targetSID = msg.target; }
+        else if (msg.t === "fire") {
+            syncSignal.tick = config.tick;
+            syncSignal.partnerSID = msg.partner;
+            syncSignal.targetSID = msg.target;
+            syncSignal.arriveAt = Date.now() + 150 - this.#oneWayRelay;
+            if (meleeSyncAction) meleeSyncAction.onFire();
+        }
+        else if (msg.t === "time") {
+            this.#rttSamples.push((Date.now() - msg.c) / 2);
+            if (this.#rttSamples.length > 9) this.#rttSamples.shift();
+            var sorted = this.#rttSamples.slice().sort(function(a, b) { return a - b; });
+            this.#oneWayRelay = sorted[sorted.length >> 1];
+        }
+        else if (msg.t === "enemies") {
+            if (msg.list) { var enow = Date.now(); for (var ei = 0; ei < msg.list.length; ++ei) { var e = msg.list[ei]; if (e && e[0] != null) peerEnemies[e[0]] = { x: e[1], y: e[2], time: enow }; } }
+        }
         else if (msg.t === "presence") addWSLog(null, (msg.name || msg.id) + (msg.online ? " joined" : " left"));
-        else if (msg.t === "error") addWSLog(null, msg.reason);
+        else if (msg.t === "error") { if (msg.reason !== "register first") addWSLog(null, msg.reason); }
     }
 }
 
@@ -1431,7 +1469,7 @@ class CombatManager {
 
     attackHat() {
         var p = this.player;
-        if (this.canPurchase(0, 55)) {
+        if (settings.combat.bloodthirster && this.canPurchase(0, 55)) {
             if (p.health <= 65) return 55;
             if (config.tick % 9 < 4) return 55;
         }
@@ -2985,16 +3023,6 @@ class DynamicOneTick {
             combatManager.sentAccEquip = true;
         }
 
-        var toEnemy = Math.atan2(nearestEnemy.y2 - player.y2, nearestEnemy.x2 - player.x2);
-        var stepOne = dOT.simApproach[0], stepTwo = dOT.simApproach[1];
-        dOTStepSelf(player, toEnemy, player, stepOne);
-        dOTStepSelf(stepOne, toEnemy, player, stepTwo);
-        var settleDist = Math.hypot(stepTwo.x2 - proj[1].x2, stepTwo.y2 - proj[1].y2) - 35;
-        var closingIn = settleDist < wdE - 35;
-        if (closingIn && settleDist >= dOT.winLo && settleDist <= dOT.winHi) this.#autoMoving = true;
-        if (this.#autoMoving && (!closingIn || settleDist < dOT.winLo)) this.#autoMoving = false;
-        if (this.#autoMoving) combatManager.moveTo = toEnemy;
-
         var ring = dOTRing(player, primary, reach, moreGold, fireHat, fireWeapon);
         if (ring !== null) {
             var latchMax = ring.hi - dOT.latchMaxPad;
@@ -3004,6 +3032,17 @@ class DynamicOneTick {
             }
             dOT.canFire = this.#canFire;
         }
+
+        var fireEligible = this.#canFire && (bow ? weaponReloads.isReloaded(player, 1) : turretReady);
+        var moving = player.moveDir !== undefined;
+        var stepOne = dOT.simApproach[0], stepTwo = dOT.simApproach[1];
+        dOTStepSelf(player, player.moveDir, player, stepOne);
+        dOTStepSelf(stepOne, player.moveDir, player, stepTwo);
+        var settleDist = Math.hypot(stepTwo.x2 - proj[1].x2, stepTwo.y2 - proj[1].y2) - 35;
+        var closingIn = settleDist < wdE - 35;
+        if (fireEligible && moving && closingIn && settleDist >= dOT.winLo && settleDist <= dOT.winHi) this.#autoMoving = true;
+        if (this.#autoMoving && (!fireEligible || !moving || !closingIn || settleDist < dOT.winLo)) this.#autoMoving = false;
+        if (this.#autoMoving && !settings.defense.safeWalk) combatManager.moveTo = player.moveDir;
 
         var plan = dOTPlan(player, primary, reach, moreGold, proj, fireHat, fireWeapon);
         if (plan !== null
@@ -3773,6 +3812,10 @@ class MeleeSync {
 
     action_id = "Melee Sync";
     useTurret = false;
+    #holding = false;
+    #swingAt = 0;
+    #target = null;
+    #syncAcc = null;
 
     #selfReady(player, enemy) {
         if (enemy === null || combatIntel.shouldIgnoreAction()) return false;
@@ -3793,7 +3836,7 @@ class MeleeSync {
 
     update() {
         var player = combatManager.player;
-        if (!combatManager.syncToggle) { this.useTurret = false; return; }
+        if (!combatManager.syncToggle) { this.useTurret = false; this.#cancel(); return; }
         var nearestEnemy = combatIntel.nearestEnemy;
         var turretReloaded = combatManager.ownsItem(0, 53) && weaponReloads.isReloaded(player, 2);
         if (this.useTurret) {
@@ -3801,31 +3844,59 @@ class MeleeSync {
             if (turretReloaded && !combatIntel.shouldIgnoreAction()) { combatManager.active = true; combatManager.forceHat = 53; }
             return;
         }
+        if (this.#holding) {
+            if (nearestEnemy === null || !player.alive) { this.#cancel(); return; }
+            combatManager.active = true;
+            if (combatManager.canPurchase(0, 7)) combatManager.forceHat = 7;
+            combatManager.equipStoreItem(1, this.#syncAcc == null ? 0 : this.#syncAcc);
+            if (Date.now() >= this.#swingAt) {
+                this.#holding = false;
+                var enemy = findPlayerBySID(this.#target) || nearestEnemy;
+                var fx = enemy.predicted ? enemy.predicted.likely.x : enemy.x2;
+                var fy = enemy.predicted ? enemy.predicted.likely.y : enemy.y2;
+                var pfx = player.predicted ? player.predicted.likely.x : player.x2;
+                var pfy = player.predicted ? player.predicted.likely.y : player.y2;
+                var angle = Math.atan2(fy - pfy, fx - pfx);
+                combatManager.bestAim = angle;
+                combatManager.swingWeapon(0, angle);
+                combatManager.releaseAttack();
+                this.useTurret = true;
+            }
+            return;
+        }
         var ready = this.#selfReady(player, nearestEnemy);
         relay.publishSync(nearestEnemy ? nearestEnemy.sid : null, ready);
-        if (combatManager.active || nearestEnemy === null) return;
-        if (!ready) { combatManager.forceWeapon = 0; return; }
-        var other = this.#partner(nearestEnemy);
+        if (ready && player.tailIndex === 11) {
+            var armAcc = combatManager.attackAcc();
+            combatManager.equipStoreItem(1, armAcc == null ? 0 : armAcc);
+            combatManager.sentAccEquip = true;
+        }
+        if (!combatManager.active && nearestEnemy !== null && !ready) combatManager.forceWeapon = 0;
+    }
+
+    onFire() {
+        var player = combatManager.player;
+        if (this.#holding || !combatManager.syncToggle || !inGame || !player || !player.alive) return;
+        var enemy = combatIntel.nearestEnemy;
+        if (enemy === null || !this.#selfReady(player, enemy)) return;
+        var other = this.#partner(enemy);
         if (other === null) return;
-        var primary1 = player.weapons[0];
         var primary2 = other.primary;
         if (primary2 == null || !items.weapons[primary2]) return;
-        var primaryDamage1 = combatIntel.maxWeaponDmg(player, primary1, false, false);
-        var primaryDamage2 = combatIntel.maxWeaponDmg(other, primary2, false, false);
-        if ((primaryDamage1 + primaryDamage2) * 0.75 < 100) return;
-        if (!nearVelocity(other, nearestEnemy, items.weapons[primary2].range + hitScale(nearestEnemy))) return;
+        if (!nearVelocity(other, enemy, items.weapons[primary2].range + hitScale(enemy))) return;
         if (!weaponReloads.isReloaded(other, 0)) return;
-        var fx = nearestEnemy.predicted ? nearestEnemy.predicted.likely.x : nearestEnemy.x2;
-        var fy = nearestEnemy.predicted ? nearestEnemy.predicted.likely.y : nearestEnemy.y2;
-        var pfx = player.predicted ? player.predicted.likely.x : player.x2;
-        var pfy = player.predicted ? player.predicted.likely.y : player.y2;
-        var angleToEnemy = Math.atan2(fy - pfy, fx - pfx);
-        combatManager.active = true;
-        combatManager.bestAim = angleToEnemy;
-        combatManager.lockEquip(7, combatManager.attackAcc());
-        combatManager.swingWeapon(0, angleToEnemy);
-        combatManager.releaseAttack();
-        this.useTurret = true;
+        combatManager.equipStoreItem(0, combatManager.canPurchase(0, 7) ? 7 : 0);
+        combatManager.sentHatEquip = true;
+        this.#syncAcc = combatManager.attackAcc();
+        combatManager.equipStoreItem(1, this.#syncAcc == null ? 0 : this.#syncAcc);
+        combatManager.sentAccEquip = true;
+        this.#holding = true;
+        this.#target = enemy.sid;
+        this.#swingAt = syncSignal.arriveAt ? (syncSignal.arriveAt - medianPing / 2) : (Date.now() + 220);
+    }
+
+    #cancel() {
+        this.#holding = false;
     }
 }
 
@@ -5876,6 +5947,19 @@ if (location.hostname == "sandbox.moomoo.io" || location.hostname == "sandbox-de
 }
 
 var siteKey = isProd ? "0x4AAAAAAAMYHI96GFiJzMmp" : "1x00000000000000000000AA";
+var tsHiddenCss = "position:absolute;left:-99999px;top:0;width:300px;height:65px;";
+var tsShownCss = "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;display:flex;flex-direction:column;align-items:center;gap:11px;background:#fff;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.08);box-shadow:0 10px 34px rgba(0,0,0,0.35);";
+function buildTurnstileBox() {
+    var host = document.createElement("div");
+    host.style.cssText = tsHiddenCss;
+    var header = document.createElement("div");
+    header.style.cssText = "text-align:center;color:#2b2b2b;font-family:'Hammersmith One',sans-serif;line-height:1.15;";
+    header.innerHTML = "<div style='font-size:18px;'>Tailwind</div><div style='font-size:12px;color:rgba(0,0,0,0.45);margin-top:1px;'>generate token</div>";
+    var slot = document.createElement("div");
+    host.appendChild(header);
+    host.appendChild(slot);
+    return { host: host, slot: slot };
+}
 var turnstileToken = window.cfToken || null;
 window.cfOnToken = function(token) {
     turnstileToken = token;
@@ -5886,23 +5970,23 @@ if (turnstileToken) window.cfOnToken(turnstileToken);
 if (!window.cfHandled) {
     var turnstile = {
         host: null,
+        slot: null,
         widgetID: null,
-        hidden: "position:absolute;left:-99999px;top:0;width:300px;height:65px;",
-        shown:  "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;background:#fff;padding:10px;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.35);",
-        hide:   function() { if (this.host) this.host.style.cssText = this.hidden; },
-        reveal: function() { if (this.host) this.host.style.cssText = this.shown; },
+        hide:   function() { if (this.host) this.host.style.cssText = tsHiddenCss; },
+        reveal: function() { if (this.host) this.host.style.cssText = tsShownCss; },
         render: function() {
             if (this.widgetID !== null) return true;
             if (!(window.turnstile && typeof window.turnstile.render === "function")) return false;
             if (!this.host) {
                 if (!document.body) return false;
-                this.host = document.createElement("div");
+                var box = buildTurnstileBox();
+                this.host = box.host;
+                this.slot = box.slot;
                 this.host.id = "turnstileHost";
-                this.host.style.cssText = this.hidden;
                 document.body.appendChild(this.host);
             }
             try {
-                this.widgetID = window.turnstile.render(this.host, {
+                this.widgetID = window.turnstile.render(this.slot, {
                     sitekey: siteKey,
                     theme: "light",
                     appearance: "interaction-only",
@@ -5966,7 +6050,7 @@ function connectSocketIfReady() {
     if (isProd && !turnstileToken) return;
     startedConnecting = true;
 
-    addLog(null, 'Tailwind [v11, 2026.07.21]', null, true);
+    addLog(null, 'Tailwind [v15, 2026.07.24]', null, true);
 
     connectSocket(isProd ? "cf:" + turnstileToken : null);
 }
@@ -5976,6 +6060,7 @@ function connectSocket(token) {
         if (!isProd) {
             wsAddress = "wss://localhost:3000";
         }
+        botManager.serverBase = wsAddress;
         if (token) {
             wsAddress += "?token=" + encodeURIComponent(token);
         }
@@ -6165,6 +6250,7 @@ var settingsButtonTitle = menuSettingsButton.getElementsByTagName("span")[0];
 var allianceButton = document.getElementById("allianceButton");
 var storeButton = document.getElementById("storeButton");
 var settingsButton = document.getElementById("settingsButton");
+var toolsButton = document.getElementById("toolsButton");
 var gameCanvas = document.getElementById("gameCanvas");
 var mainContext = gameCanvas.getContext("2d", { alpha: false });
 var serverBrowser = document.getElementById("serverBrowser");
@@ -6208,8 +6294,11 @@ mapDisplay.height = biomeImage.height = 300;
 var storeMenu = document.getElementById("storeMenu");
 var storeHolder = document.getElementById("storeHolder");
 var settingsMenu = document.getElementById("settingsMenu");
+var toolsMenu = document.getElementById("toolsMenu");
 var settingsTabs = document.getElementById("settingsTabs");
 var settingsBody = document.getElementById("settingsBody");
+var toolsBody = document.getElementById("toolsBody");
+var toolsToast = document.getElementById("toolsToast");
 var noticationDisplay = document.getElementById("noticationDisplay");
 var hats = store.hats;
 var accessories = store.accessories;
@@ -6284,7 +6373,7 @@ combatManager.actions.push(
     new SpikeKnockTrap(),
     new KnockIntoTrap(),
     new BreakPunish(),
-    new MeleeSync(),
+    (meleeSyncAction = new MeleeSync()),
     new TurretSync(),
     new SpikeSync(),
     new SpikeSyncHammer(),
@@ -6324,14 +6413,14 @@ offenseActions.add("Dynamic OneTick");
 offenseActions.add("Melee Sync");
 
 var settings = {
-    combat:  { instakill: true, reverseInsta: true, bowInsta: false, dynamicOneTick: true, katanaInsta: true, knockbackInsta: true, knockbackHammerInsta: true, spikeTick: true, knockbackTrap: true, knockIntoTrap: true, plagueHit: true, breakPunish: false, meleeSync: true, turretSync: true, spikeSync: false, spikeSyncHammer: true, bleedInsta: true, appleInsta: true, autoPush: true, pushMode: "ppo" },
+    combat:  { instakill: true, reverseInsta: true, bowInsta: false, dynamicOneTick: true, katanaInsta: true, knockbackInsta: true, knockbackHammerInsta: true, spikeTick: true, knockbackTrap: true, knockIntoTrap: true, plagueHit: true, breakPunish: false, meleeSync: true, turretSync: true, spikeSync: false, spikeSyncHammer: true, bleedInsta: true, appleInsta: true, autoPush: true, bloodthirster: false, pushMode: "ppo" },
     defense: { autoHeal: true, autoPlace: true, safeWalk: true, autoBreak: true, preRetrap: true, placementDefense: true, shameLeak: true, retrapMove: true },
-    visuals: { placeGhosts: true, placeLines: false, threatBar: true, reticles: true, vectors: true, hitMarkers: true, hudBars: false, lbPanel: true, chatLog: true, packetLogs: false,
-              playerSids: true, sidRadar: true, shameText: true, healInfo: true, reloadBars: false, hpText: false, turretArc: true, turretBar: true, nameStyle: true, uiMetrics: true, darkOutlines: true, barStyle: true, dmgText: true, nightTint: true, chunkGrid: true, treeReveal: true, enemySpikeTint: true, buildDepth: true, biomeMinimap: true, brokenMarkers: true, deathGhost: false, deathShatter: true, kbGhost: true, kbLanding: true, itemCounters: true, feedbackText: true, cameraFollow: false, staticMills: true, customMenus: true, trapGhosts: true, advancedStats: true, ae86Aim: false },
+    visuals: { placeGhosts: true, placeLines: false, threatBar: true, reticles: true, vectors: true, hitMarkers: true, hudBars: false, lbPanel: true, chatLog: true, packetLogs: true,
+              playerSids: true, sidRadar: true, shameText: true, healInfo: true, reloadBars: true, reloadSmooth: true, hpText: false, turretArc: true, turretBar: true, nameStyle: true, uiMetrics: true, darkOutlines: true, barStyle: true, dmgText: true, nightTint: true, chunkGrid: true, treeReveal: true, enemySpikeTint: true, buildDepth: true, biomeMinimap: true, brokenMarkers: true, deathGhost: false, deathShatter: true, kbGhost: true, kbLanding: true, itemCounters: true, feedbackText: true, cameraFollow: false, staticMills: true, customMenus: true, trapGhosts: true, advancedStats: true, ae86Aim: false },
     misc:    { defaultHat: true, defaultAcc: true, utilityHat: true, autoReload: true, autoBuy: true }
 };
 var settingsDefaults = JSON.parse(JSON.stringify(settings));
-var tailwindVersion = "[v11, 2026.07.21]";
+var tailwindVersion = "[v15, 2026.07.24]";
 if (getSavedVal("tailwindVersion") !== tailwindVersion) {
     deleteVal("settings");
     deleteVal("keybinds");
@@ -6366,7 +6455,8 @@ var settingsMeta = {
         spikeSyncHammer:      "Spike Sync Hammer",
         bleedInsta:           "Bleed Insta",
         appleInsta:           "Apple Insta",
-        autoPush:             "Auto Push"
+        autoPush:             "Auto Push",
+        bloodthirster:        "Use Bloodthirster"
     } },
     defense: { title: "Defense", items: {
         autoBreak:        "Auto Break",
@@ -6401,6 +6491,7 @@ var settingsMeta = {
         shameText:   "Shame Counter",
         healInfo:    "Enemy Heal Info",
         reloadBars:  "Reload Bars",
+        reloadSmooth: "Smooth Reload Bars",
         hpText:      "HP Text",
         turretArc:   "Turret Ring",
         turretBar:   "Enemy Turret Bar",
@@ -6626,6 +6717,10 @@ function bindEvents() {
         toggleSettingsMenu();
     });
     UTILS.hookTouchEvents(settingsButton);
+    toolsButton.onclick = UTILS.checkTrusted(function() {
+        toggleToolsMenu();
+    });
+    UTILS.hookTouchEvents(toolsButton);
     allianceButton.onclick = UTILS.checkTrusted(function() {
         toggleAllianceMenu();
     });
@@ -6831,100 +6926,77 @@ function toggleAllianceMenu() {
         allianceMenu.style.display = "none";
     }
 }
+var currentAllianceTab = null;
+window.changeAllianceTab = function(tab) {
+    currentAllianceTab = tab;
+    if (allianceMenu.style.display === "block") showAllianceMenu();
+};
+function refreshBotList() {
+    if (allianceMenu.style.display === "block" && currentAllianceTab === "bots") showAllianceMenu();
+    if (toolsMenu.style.display === "block") renderToolsMenu();
+}
 function showAllianceMenu() {
-    if (player && player.alive) {
-        closeChat();
-        storeMenu.style.display = "none";
-        settingsMenu.style.display = "none";
-        allianceMenu.style.display = "block";
-        UTILS.removeAllChildren(allianceHolder);
-        if (player.team) {
-            for (var i = 0; i < alliancePlayers.length; i+=2) {
-                (function(i) {
-                    var tmp = UTILS.generateElement({
-                        class: "allianceItem",
-                        style: "color:" + (alliancePlayers[i]==player.sid ? "#fff" : "rgba(255,255,255,0.6)"),
-                        text: alliancePlayers[i+1],
-                        parent: allianceHolder
-                    });
-                    if (player.isOwner && alliancePlayers[i] != player.sid) {
-                        UTILS.generateElement({
-                            class: "joinAlBtn",
-                            text: "Kick",
-                            onclick: function() { kickFromClan(alliancePlayers[i]); },
-                            hookTouch: true,
-                            parent: tmp
-                        });
-                    }
-                })(i);
-            }
-        } else {
-            if (alliances.length) {
-                for (var i = 0; i < alliances.length; ++i) {
-                    (function(i) {
-                        var tmp = UTILS.generateElement({
-                            class: "allianceItem",
-                            style: "color:" + (alliances[i].sid==player.team ? "#fff" : "rgba(255,255,255,0.6)"),
-                            text: alliances[i].sid,
-                            parent: allianceHolder
-                        });
-                        UTILS.generateElement({
-                            class: "joinAlBtn",
-                            text: "Join",
-                            onclick: function() { sendJoin(i); },
-                            hookTouch: true,
-                            parent: tmp
-                        });
-                    })(i);
-                }
-            } else {
-                UTILS.generateElement({
-                    class: "allianceItem",
-                    text: "No Tribes Yet",
-                    parent: allianceHolder
-                });
-            }
-        }
-        UTILS.removeAllChildren(allianceManager);
-        if (player.team) {
-            UTILS.generateElement({
-                class: "allianceButtonM",
-                style: "width: 360px",
-                text: player.isOwner? "Delete Tribe" : "Leave Tribe",
-                onclick: function() { leaveAlliance() },
-                hookTouch: true,
-                parent: allianceManager
-            });
-        } else {
-            UTILS.generateElement({
-                tag: "input",
-                type: "text",
-                id: "allianceInput",
-                maxLength: 7,
-                placeholder: "unique name",
-                onchange: function(ev) {
-                    ev.target.value = (ev.target.value || "").slice(0, 7);
-                },
-                onkeypress: function(ev) {
-                    if ((ev.which||ev.keyCode||0) == 13) {
-                        ev.preventDefault();
-                        createAlliance();
-                        return false;
-                    }
-                },
-                parent: allianceManager
-            });
-            UTILS.generateElement({
-                tag: "div",
-                class: "allianceButtonM",
-                style: "width: 140px;",
-                text: "Create",
-                onclick: function() { createAlliance(); },
-                hookTouch: true,
-                parent: allianceManager
-            });
-        }
+    if (!(player && player.alive)) return;
+    closeChat();
+    storeMenu.style.display = "none";
+    settingsMenu.style.display = "none";
+    toolsMenu.style.display = "none";
+    allianceMenu.style.display = "block";
+    UTILS.removeAllChildren(allianceHolder);
+    UTILS.removeAllChildren(allianceManager);
+    if (!settings.visuals.uiMetrics) {
+        if (player.team) renderAllianceTeamTab(); else renderAllianceTeamsTab();
+        return;
     }
+    if (!currentAllianceTab || (currentAllianceTab === "team" && !player.team)) currentAllianceTab = player.team ? "team" : "teams";
+    var tabEls = document.getElementsByClassName("allianceTab");
+    var order = ["team", "teams", "bots"];
+    for (var t = 0; t < tabEls.length; ++t) tabEls[t].classList.toggle("active", order[t] === currentAllianceTab);
+    if (currentAllianceTab === "team") renderAllianceTeamTab();
+    else if (currentAllianceTab === "teams") renderAllianceTeamsTab();
+    else renderAllianceBotsTab();
+}
+function renderAllianceTeamTab() {
+    if (player.team) {
+        for (var i = 0; i < alliancePlayers.length; i += 2) {
+            (function(i) {
+                var tmp = UTILS.generateElement({ class: "allianceItem", style: "color:" + (alliancePlayers[i]==player.sid ? "#fff" : "rgba(255,255,255,0.6)"), text: alliancePlayers[i+1], parent: allianceHolder });
+                if (player.isOwner && alliancePlayers[i] != player.sid) {
+                    UTILS.generateElement({ class: "joinAlBtn", text: "Kick", onclick: function() { kickFromClan(alliancePlayers[i]); }, hookTouch: true, parent: tmp });
+                }
+            })(i);
+        }
+        UTILS.generateElement({ class: "allianceButtonM", style: "width: 360px", text: player.isOwner ? "Delete Tribe" : "Leave Tribe", onclick: function() { leaveAlliance() }, hookTouch: true, parent: allianceManager });
+    } else {
+        UTILS.generateElement({ class: "allianceItem", text: "You're Not In A Team", parent: allianceHolder });
+    }
+}
+function renderAllianceTeamsTab() {
+    if (alliances.length) {
+        for (var i = 0; i < alliances.length; ++i) {
+            (function(i) {
+                var tmp = UTILS.generateElement({ class: "allianceItem", style: "color:" + (alliances[i].sid==player.team ? "#fff" : "rgba(255,255,255,0.6)"), text: alliances[i].sid, parent: allianceHolder });
+                if (!player.team) UTILS.generateElement({ class: "joinAlBtn", text: "Join", onclick: function() { sendJoin(i); }, hookTouch: true, parent: tmp });
+            })(i);
+        }
+    } else {
+        UTILS.generateElement({ class: "allianceItem", text: "No Tribes Yet", parent: allianceHolder });
+    }
+    if (!player.team) {
+        UTILS.generateElement({ tag: "input", type: "text", id: "allianceInput", maxLength: 7, placeholder: "unique name", onchange: function(ev) { ev.target.value = (ev.target.value || "").slice(0, 7); }, onkeypress: function(ev) { if ((ev.which||ev.keyCode||0) == 13) { ev.preventDefault(); createAlliance(); return false; } }, parent: allianceManager });
+        UTILS.generateElement({ tag: "div", class: "allianceButtonM", style: "width: 140px;", text: "Create", onclick: function() { createAlliance(); }, hookTouch: true, parent: allianceManager });
+    }
+}
+function renderAllianceBotsTab() {
+    if (botManager.bots.length) {
+        botManager.bots.forEach(function(bot, i) {
+            var tmp = UTILS.generateElement({ class: "allianceItem", text: (i + 1) + ". " + bot.name, parent: allianceHolder });
+            UTILS.generateElement({ class: "joinAlBtn", text: "×", onclick: function() { botManager.removeBot(bot); refreshBotList(); }, hookTouch: true, parent: tmp });
+        });
+    } else {
+        UTILS.generateElement({ class: "allianceItem", text: "No Bots Yet", parent: allianceHolder });
+    }
+    UTILS.generateElement({ class: "allianceButtonM", style: "width: 360px", text: "Disconnect All", onclick: function() { botManager.disconnectAll(); refreshBotList(); }, hookTouch: true, parent: allianceManager });
 }
 function aJoinReq(join) {
     io.send("P", allianceNotifications[0].sid, join);
@@ -6956,7 +7028,7 @@ var broken = {
     objects: [],
     distance: 1000,
     mapLife: 10000,
-    mapSize: 25
+    mapSize: 26.5
 };
 function MapPing() {
     this.init = function(x, y) {
@@ -7002,9 +7074,28 @@ function updateMapMarker() {
 function updateMinimap(data) {
     minimapData = data;
 }
+var peerEnemies = {};
+var lastEnemyBroadcast = 0;
+function myVisibleEnemies() {
+    var out = [];
+    for (var i = 0; i < players.length; ++i) {
+        var p = players[i];
+        if (p === player || !p.visible || p.health <= 0) continue;
+        if (p.team && p.team === player.team) continue;
+        out.push([p.sid, p.x2 != null ? p.x2 : p.x, p.y2 != null ? p.y2 : p.y]);
+    }
+    return out;
+}
+function broadcastEnemies() {
+    var now = Date.now();
+    if (now - lastEnemyBroadcast < 450) return;
+    lastEnemyBroadcast = now;
+    if (player && player.alive) relay.sendEnemies(myVisibleEnemies());
+}
 function renderMinimap(delta) {
     if (player && player.alive) {
         mapContext.clearRect(0, 0, mapDisplay.width, mapDisplay.height);
+        broadcastEnemies();
 
         mapContext.strokeStyle = "#fff";
         mapContext.lineWidth = 4;
@@ -7024,6 +7115,24 @@ function renderMinimap(delta) {
                              (minimapData[i+1]/config.mapScale)*mapDisplay.height, 7, mapContext, true);
                 i+=2;
             }
+        }
+
+        var enemySeen = {};
+        mapContext.fillStyle = "#cc5151";
+        var myEnemies = myVisibleEnemies();
+        for (var ei = 0; ei < myEnemies.length; ++ei) {
+            var me = myEnemies[ei];
+            if (enemySeen[me[0]]) continue;
+            enemySeen[me[0]] = 1;
+            renderCircle((me[1]/config.mapScale)*mapDisplay.width, (me[2]/config.mapScale)*mapDisplay.height, 7, mapContext, true);
+        }
+        var enemyNow = Date.now();
+        for (var esid in peerEnemies) {
+            var pe = peerEnemies[esid];
+            if (enemyNow - pe.time > 2000) { delete peerEnemies[esid]; continue; }
+            if (enemySeen[esid] || esid == player.sid) continue;
+            enemySeen[esid] = 1;
+            renderCircle((pe.x/config.mapScale)*mapDisplay.width, (pe.y/config.mapScale)*mapDisplay.height, 7, mapContext, true);
         }
 
         if (settings.visuals.brokenMarkers && broken.objects.length) {
@@ -7076,6 +7185,7 @@ function toggleStoreMenu() {
         storeMenu.style.display = "block";
         allianceMenu.style.display = "none";
         settingsMenu.style.display = "none";
+        toolsMenu.style.display = "none";
         closeChat();
         generateStoreList();
     } else {
@@ -7240,10 +7350,25 @@ function toggleSettingsMenu() {
         settingsMenu.style.display = "block";
         storeMenu.style.display = "none";
         allianceMenu.style.display = "none";
+        toolsMenu.style.display = "none";
         closeChat();
         generateSettingsMenu();
     } else {
         settingsMenu.style.display = "none";
+    }
+}
+function toggleToolsMenu() {
+    resetMoveDir();
+    if (toolsMenu.style.display != "block") {
+        toolsMenu.style.display = "block";
+        storeMenu.style.display = "none";
+        allianceMenu.style.display = "none";
+        settingsMenu.style.display = "none";
+        closeChat();
+        renderToolsMenu();
+        if (!botManager.timer) botManager.timer = setInterval(function() { if (toolsMenu.style.display === "block") updateToolsValues(); }, 1000);
+    } else {
+        toolsMenu.style.display = "none";
     }
 }
 function generateSettingsMenu() {
@@ -7401,10 +7526,420 @@ function generateSettingsMenu() {
     }
 }
 
+var botManager = {
+    pool: { tokens: [], generating: 0, ttl: 300000, lastMS: null },
+    genN: 5,
+    vals: null,
+    timer: null,
+    serverBase: null,
+    coastMul: 1 / (1 - Math.pow(0.993, 1000 / 9)),
+    orbitSpeed: 0.13,
+    manjiPts: [[0,0],[0,-1],[-1,0],[0,1],[1,0],[0,-2],[-2,0],[0,2],[2,0],[1,-2],[-2,-1],[-1,2],[2,1],[2,-2],[-2,-2],[-2,2],[2,2]],
+    dropOpen: false,
+    config: { name: "meow bot", skin: 0, chats: [], movement: "cursor", followSID: "", circleRadius: "" },
+    bots: [],
+    nextId: 1,
+    sidClearTimer: null,
+    movementDocHandler: null,
+    addBot: function() {
+        if (!botManager.serverBase) { showToolsToast("join a game first"); return; }
+        prunePool();
+        if (!botManager.pool.tokens.length) { showToolsToast("no tokens — generate one first"); return; }
+        var tk = botManager.pool.tokens.shift();
+        var bot = {
+            id: botManager.nextId++,
+            conn: null, sid: null,
+            x: 0, y: 0, prevX: 0, prevY: 0, health: 100, maxHealth: 100,
+            alive: false, moving: false, settled: false,
+            moveAngle: null, aimAngle: null, lastMoveDir: null, lastAim: null,
+            weaponIndex: 0, buildIndex: -1, team: null, clanTimer: 0,
+            skinIndex: 0, receivedDamage: 0, shameCount: 0, shameTimer: 0,
+            ping: 100, pingSamples: [], pingSent: 0,
+            chatIdx: 0, chatTimer: 0,
+            name: botManager.config.name, skin: botManager.config.skin
+        };
+        var url = botManager.serverBase + "?token=" + encodeURIComponent("cf:" + tk.token);
+        bot.conn = io.spawnBot(url, function(err) {
+            if (err) { botManager.removeBot(bot); return; }
+            botManager.doSpawn(bot);
+        }, botManager.makeEvents(bot));
+        botManager.bots.push(bot);
+        refreshBotList();
+    },
+    doSpawn: function(bot) {
+        if (!bot.conn) return;
+        bot.conn.send("M", { name: bot.name, moofoll: moofoll, skin: bot.skin === 10 ? "constructor" : bot.skin });
+    },
+    makeEvents: function(bot) {
+        return {
+            "C": function(yourSID) { bot.sid = yourSID; refreshBotList(); },
+            "a": function(data) {
+                for (var i = 0; i < data.length; i += 13) {
+                    if (data[i] === bot.sid) {
+                        bot.prevX = bot.x; bot.prevY = bot.y;
+                        bot.x = data[i + 1]; bot.y = data[i + 2];
+                        bot.buildIndex = data[i + 4]; bot.weaponIndex = data[i + 5];
+                        bot.team = data[i + 7];
+                        bot.skinIndex = data[i + 9];
+                        if (bot.skinIndex === 45) { bot.shameCount = 0; if (!bot.shameTimer) bot.shameTimer = Date.now(); }
+                        else bot.shameTimer = 0;
+                        bot.alive = true;
+                        break;
+                    }
+                }
+                botManager.tick(bot);
+            },
+            "O": function(sid, value) { if (sid !== bot.sid) return; if (bot.health - value > 0) bot.receivedDamage = Date.now(); bot.health = value; },
+            "0": function() { bot.pingSamples.push(Date.now() - bot.pingSent); if (bot.pingSamples.length > 10) bot.pingSamples.shift(); var s = bot.pingSamples.slice().sort(function(a, b) { return a - b; }); bot.ping = s[s.length >> 1]; },
+            "P": function() { bot.alive = false; setTimeout(function() { if (bot.conn) botManager.doSpawn(bot); }, 1000); },
+            "__close": function() { botManager.removeBot(bot); }
+        };
+    },
+    tick: function(bot) {
+        if (!bot.conn) return;
+        if (!bot.alive || !player || !player.alive) { botManager.move(bot, null); return; }
+        var cursorX = camX + (mouseX - screenWidth / 2) / screenScale;
+        var cursorY = camY + (mouseY - screenHeight / 2) / screenScale;
+        var idx = botManager.bots.indexOf(bot), slot;
+        if (botManager.config.movement === "circle") slot = botManager.ringSlot(idx, botManager.bots.length, player.x2, player.y2);
+        else if (botManager.config.movement === "manji") slot = botManager.manjiSlot(idx, botManager.bots.length, cursorX, cursorY);
+        else if (botManager.config.movement === "follow") { var ft = botManager.followTarget(); slot = botManager.slot(idx + 1, ft ? ft.x2 : player.x2, ft ? ft.y2 : player.y2); }
+        else slot = botManager.slot(idx, cursorX, cursorY);
+        var sdx = slot.x - bot.x, sdy = slot.y - bot.y;
+        var sdist = Math.sqrt(sdx * sdx + sdy * sdy);
+        var vx = bot.x - bot.prevX, vy = bot.y - bot.prevY;
+        var coastDist = Math.sqrt(vx * vx + vy * vy) * botManager.coastMul;
+        if (botManager.config.movement === "circle") {
+            bot.settled = false;
+            bot.moveAngle = sdist < 0.5 ? bot.lastMoveDir : Math.atan2(sdy, sdx);
+        } else {
+            if (bot.settled) { if (sdist > player.scale * 1.5) bot.settled = false; }
+            else if (sdist < player.scale * 0.5 || coastDist >= sdist) bot.settled = true;
+            bot.moveAngle = bot.settled ? null : Math.atan2(sdy, sdx);
+        }
+        bot.aimAngle = Math.atan2(cursorY - bot.y, cursorX - bot.x);
+        botManager.aim(bot, bot.aimAngle);
+        botManager.move(bot, bot.moveAngle);
+        botManager.joinClan(bot);
+        botManager.heal(bot);
+        botManager.chat(bot);
+        var now = Date.now();
+        if (now - bot.pingSent >= 2500) { bot.pingSent = now; bot.conn.send("0"); }
+    },
+    move: function(bot, angle) {
+        if (angle == null) {
+            if (bot.moving) { bot.conn.send("9", undefined); bot.moving = false; bot.lastMoveDir = null; }
+            return;
+        }
+        if (!bot.moving || bot.lastMoveDir == null || Math.abs(angle - bot.lastMoveDir) > 0.2) {
+            bot.conn.send("9", angle);
+            bot.moving = true; bot.lastMoveDir = angle;
+        }
+    },
+    aim: function(bot, angle) {
+        if (bot.lastAim == null || Math.abs(angle - bot.lastAim) > 0.05) {
+            bot.conn.send("D", angle);
+            bot.lastAim = angle;
+        }
+    },
+    slot: function(i, cx, cy) {
+        if (i <= 0) return { x: cx, y: cy };
+        var spacing = player.scale * 2.6;
+        var k = 1, start = 1;
+        while (i >= start + 6 * k) { start += 6 * k; k++; }
+        var pos = i - start, count = 6 * k;
+        var ang = pos / count * 6.283185307179586 + k * 0.5;
+        var rad = k * spacing;
+        return { x: cx + Math.cos(ang) * rad, y: cy + Math.sin(ang) * rad };
+    },
+    circleMinRadius: function(n) {
+        return Math.max(player.scale * 2.6, n * player.scale * 2.6 / 6.283185307179586);
+    },
+    circleRadius: function(n) {
+        var minR = botManager.circleMinRadius(n);
+        var v = parseFloat(botManager.config.circleRadius);
+        return (isNaN(v) || v < minR) ? minR : v;
+    },
+    ringSlot: function(i, n, cx, cy) {
+        var rad = botManager.circleRadius(n);
+        var ang = (n > 0 ? i / n : 0) * 6.283185307179586 + Date.now() * botManager.orbitSpeed / rad;
+        return { x: cx + Math.cos(ang) * rad, y: cy + Math.sin(ang) * rad };
+    },
+    manjiSlot: function(i, n, cx, cy) {
+        var pts = botManager.manjiPts;
+        if (i >= pts.length) return botManager.ringSlot(i - pts.length, Math.max(1, n - pts.length), cx, cy);
+        var s = player.scale * 2.2;
+        return { x: cx + pts[i][0] * s, y: cy + pts[i][1] * s };
+    },
+    followTarget: function() {
+        if (botManager.config.movement !== "follow") return null;
+        var s = parseInt(botManager.config.followSID, 10);
+        if (isNaN(s) || !isAlly(s)) return null;
+        var t = findPlayerBySID(s);
+        return (t && t.visible) ? t : null;
+    },
+    place: function(bot, itemId, angle) {
+        if (!bot.conn) return;
+        bot.conn.send("z", itemId, 0);
+        bot.conn.send("F", 1, angle);
+        bot.conn.send("z", bot.weaponIndex != null ? bot.weaponIndex : 0, 1);
+    },
+    heal: function(bot) {
+        if (bot.health >= bot.maxHealth || bot.shameTimer > 0) return;
+        var restore = 20;
+        var needTimes = Math.ceil((bot.maxHealth - bot.health) / restore);
+        var forceHeal = bot.health <= 20;
+        var safe = Date.now() - (bot.receivedDamage || 0) + bot.ping >= 125;
+        var healingTimes = null;
+        if (forceHeal && bot.shameCount < 7 && bot.health < 95) healingTimes = needTimes || 1;
+        else if (safe && bot.health < 100) healingTimes = needTimes || 1;
+        if (healingTimes === null) return;
+        if (bot.receivedDamage) {
+            if (!safe) { bot.shameCount = (bot.shameCount || 0) + 1; if (bot.shameCount >= 8) { bot.shameCount = 0; bot.shameTimer = bot.shameTimer || Date.now(); } }
+            else { bot.shameCount = Math.max(0, (bot.shameCount || 0) - 2); }
+            bot.receivedDamage = 0;
+        }
+        for (var i = 0; i < healingTimes; i++) botManager.place(bot, 0, null);
+    },
+    chat: function(bot) {
+        if (!botManager.config.chats.length) return;
+        var now = Date.now();
+        if (now - bot.chatTimer < 3000) return;
+        bot.chatTimer = now;
+        bot.conn.send("6", botManager.config.chats[bot.chatIdx % botManager.config.chats.length]);
+        bot.chatIdx++;
+    },
+    joinClan: function(bot) {
+        if (!player || !player.team) return;
+        if (bot.team === player.team) return;
+        var now = Date.now();
+        if (now - bot.clanTimer < 3000) return;
+        bot.clanTimer = now;
+        bot.conn.send("b", player.team);
+    },
+    removeBot: function(bot) {
+        var idx = botManager.bots.indexOf(bot);
+        if (idx >= 0) botManager.bots.splice(idx, 1);
+        if (bot.conn) { bot.conn.close(); bot.conn = null; }
+        refreshBotList();
+    },
+    disconnectAll: function() {
+        botManager.bots.forEach(function(b) { if (b.conn) { b.conn.close(); b.conn = null; } });
+        botManager.bots.length = 0;
+        refreshBotList();
+    }
+};
+
+function generateToken() {
+    if (!(window.turnstile && typeof window.turnstile.render === "function")) return;
+    var box = buildTurnstileBox();
+    var host = box.host;
+    document.body.appendChild(host);
+    var settled = false, widgetID = null, t0 = Date.now(), giveUp = null;
+    function finish() {
+        if (settled) return;
+        settled = true;
+        if (giveUp) clearTimeout(giveUp);
+        botManager.pool.generating--;
+        try { if (widgetID != null) window.turnstile.remove(widgetID); } catch (e) {}
+        if (host.parentNode) host.parentNode.removeChild(host);
+        updateToolsValues();
+    }
+    botManager.pool.generating++;
+    updateToolsValues();
+    try {
+        widgetID = window.turnstile.render(box.slot, {
+            sitekey: siteKey,
+            theme: "light",
+            appearance: "interaction-only",
+            "refresh-expired": "manual",
+            callback: function(t) { botManager.pool.lastMS = Date.now() - t0; botManager.pool.tokens.push({ token: t, born: Date.now() }); finish(); },
+            "error-callback": function() { finish(); },
+            "timeout-callback": function() { host.style.cssText = tsHiddenCss; finish(); },
+            "before-interactive-callback": function() { host.style.cssText = tsShownCss; if (giveUp) clearTimeout(giveUp); giveUp = setTimeout(finish, 90000); },
+            "after-interactive-callback": function() { host.style.cssText = tsHiddenCss; }
+        });
+    } catch (e) { finish(); return; }
+    giveUp = setTimeout(finish, 25000);
+}
+
+function generateBatch(n) {
+    var i = 0;
+    function step() {
+        generateToken();
+        if (++i < n) setTimeout(step, 1000);
+    }
+    if (n > 0) step();
+}
+
+function prunePool() {
+    var now = Date.now();
+    for (var i = botManager.pool.tokens.length - 1; i >= 0; i--) {
+        if (now - botManager.pool.tokens[i].born >= botManager.pool.ttl) botManager.pool.tokens.splice(i, 1);
+    }
+}
+
+function soonestExpiry() {
+    if (!botManager.pool.tokens.length) return null;
+    var now = Date.now(), min = Infinity;
+    for (var i = 0; i < botManager.pool.tokens.length; i++) {
+        var left = Math.ceil((botManager.pool.ttl - (now - botManager.pool.tokens[i].born)) / 1000);
+        if (left < min) min = left;
+    }
+    return Math.max(0, min);
+}
+
+function updateToolsValues() {
+    prunePool();
+    if (!botManager.vals || toolsMenu.style.display !== "block") return;
+    botManager.vals.available.textContent = String(botManager.pool.tokens.length);
+    botManager.vals.generating.textContent = String(botManager.pool.generating);
+    botManager.vals.lastMS.textContent = botManager.pool.lastMS == null ? "—" : botManager.pool.lastMS + "ms";
+    var soon = soonestExpiry();
+    botManager.vals.nextExpiry.textContent = soon == null ? "—" : soon + "s";
+}
+
+var toolsToastTimer = null;
+function showToolsToast(msg) {
+    if (!toolsToast) return;
+    toolsToast.textContent = msg;
+    toolsToast.classList.add("show");
+    if (toolsToastTimer) clearTimeout(toolsToastTimer);
+    toolsToastTimer = setTimeout(function() { toolsToast.classList.remove("show"); }, 2200);
+}
+
+function renderToolsMenu() {
+    UTILS.removeAllChildren(toolsBody);
+
+    var tokensRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "tokens", parent: tokensRow });
+    UTILS.generateElement({ class: "settingsRule", parent: tokensRow });
+    var tokensGroup = UTILS.generateElement({ class: "settingsModeInline", parent: tokensRow });
+    var genCountField = UTILS.generateElement({ tag: "input", class: "toolsInput toolsNum", type: "text", inputmode: "numeric", value: String(botManager.genN), maxLength: 3, parent: tokensGroup });
+    genCountField.oninput = function() { var n = parseInt(genCountField.value, 10); if (!isNaN(n)) botManager.genN = Math.max(1, Math.min(50, n)); };
+    UTILS.generateElement({ class: "settingsSelectOpt", text: "Generate", onclick: function() { generateBatch(botManager.genN); }, hookTouch: true, parent: tokensGroup });
+    var availCounter = UTILS.generateElement({ class: "settingsCounter", text: "0", parent: tokensRow });
+
+    var genRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "generating", parent: genRow });
+    UTILS.generateElement({ class: "settingsRule", parent: genRow });
+    var genGroup = UTILS.generateElement({ class: "settingsModeInline", parent: genRow });
+    UTILS.generateElement({ class: "settingsModeLabel", text: "Time", parent: genGroup });
+    var timeCounter = UTILS.generateElement({ class: "settingsCounter", text: "—", parent: genGroup });
+    var genCounter = UTILS.generateElement({ class: "settingsCounter", text: "0", parent: genRow });
+
+    var expireRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "next expires", parent: expireRow });
+    UTILS.generateElement({ class: "settingsRule", parent: expireRow });
+    var expireCounter = UTILS.generateElement({ class: "settingsCounter", text: "—", parent: expireRow });
+
+    UTILS.generateElement({ class: "toolsDivider", parent: toolsBody });
+
+    var botRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "bots", parent: botRow });
+    UTILS.generateElement({ class: "settingsRule", parent: botRow });
+    var botGroup = UTILS.generateElement({ class: "settingsModeInline", parent: botRow });
+    UTILS.generateElement({ class: "settingsModeLabel", text: "Spawn", parent: botGroup });
+    var botSelect = UTILS.generateElement({ class: "settingsSelect", parent: botGroup });
+    UTILS.generateElement({ class: "settingsSelectOpt", text: "Add Bot", onclick: function() { botManager.addBot(); }, hookTouch: true, parent: botSelect });
+    UTILS.generateElement({ class: "settingsSelectOpt", text: "Disconnect All", onclick: function() { botManager.disconnectAll(); }, hookTouch: true, parent: botSelect });
+    UTILS.generateElement({ class: "settingsCounter", text: String(botManager.bots.length), parent: botRow });
+
+    var skinRow = UTILS.generateElement({ class: "settingsItem toolsSkinRow", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "skin color", parent: skinRow });
+    UTILS.generateElement({ class: "settingsRule", parent: skinRow });
+    var skinWrap = UTILS.generateElement({ class: "toolsSkins", parent: skinRow });
+    config.skinColors.forEach(function(col, i) {
+        UTILS.generateElement({
+            class: "toolsSkin" + (botManager.config.skin === i ? " active" : ""),
+            style: "background-color:" + col,
+            onclick: function() { botManager.config.skin = i; renderToolsMenu(); },
+            hookTouch: true,
+            parent: skinWrap
+        });
+    });
+
+    var nameRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "name", parent: nameRow });
+    UTILS.generateElement({ class: "settingsRule", parent: nameRow });
+    var nameGroup = UTILS.generateElement({ class: "settingsSelect", parent: nameRow });
+    var nameField = UTILS.generateElement({ tag: "input", class: "toolsInput", type: "text", value: botManager.config.name, maxLength: 15, parent: nameGroup });
+    nameField.oninput = function() { botManager.config.name = nameField.value; };
+
+    var chatRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "auto chat", parent: chatRow });
+    UTILS.generateElement({ class: "settingsRule", parent: chatRow });
+    var chatGroup = UTILS.generateElement({ class: "settingsSelect", parent: chatRow });
+    var chatField = UTILS.generateElement({ tag: "input", class: "toolsInput toolsChat", type: "text", placeholder: "write text here", maxLength: 30, parent: chatGroup });
+    UTILS.generateElement({ class: "settingsSelectOpt", text: "Add Chat", onclick: function() {
+        var v = chatField.value.trim();
+        if (v) { botManager.config.chats.push(v); renderToolsMenu(); }
+    }, hookTouch: true, parent: chatGroup });
+
+    botManager.config.chats.forEach(function(line, i) {
+        var chatItem = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+        UTILS.generateElement({ class: "settingsLabel", text: line, parent: chatItem });
+        UTILS.generateElement({ class: "settingsRule", parent: chatItem });
+        UTILS.generateElement({ class: "settingsSelectOpt", text: "×", onclick: function() { botManager.config.chats.splice(i, 1); renderToolsMenu(); }, hookTouch: true, parent: chatItem });
+    });
+
+    var moveRow = UTILS.generateElement({ class: "settingsItem", parent: toolsBody });
+    UTILS.generateElement({ class: "settingsLabel", text: "movement", parent: moveRow });
+    UTILS.generateElement({ class: "settingsRule", parent: moveRow });
+    var moveGroup = UTILS.generateElement({ class: "settingsModeInline", parent: moveRow });
+    if (botManager.config.movement === "follow") {
+        UTILS.generateElement({ class: "settingsModeLabel", text: "Type", parent: moveGroup });
+        var sidField = UTILS.generateElement({ tag: "input", class: "toolsInput toolsNum", type: "text", inputmode: "numeric", placeholder: "sid", value: botManager.config.followSID || (player && player.sid != null ? String(player.sid) : ""), maxLength: 8, parent: moveGroup });
+        sidField.oninput = function() {
+            botManager.config.followSID = sidField.value;
+            if (botManager.sidClearTimer) clearTimeout(botManager.sidClearTimer);
+            botManager.sidClearTimer = setTimeout(function() {
+                var s = parseInt(botManager.config.followSID, 10);
+                if (isNaN(s) || !isAlly(s)) { botManager.config.followSID = ""; if (toolsMenu.style.display === "block") renderToolsMenu(); }
+            }, 3500);
+        };
+    }
+    if (botManager.config.movement === "circle") {
+        UTILS.generateElement({ class: "settingsModeLabel", text: "Radius", parent: moveGroup });
+        var radField = UTILS.generateElement({ tag: "input", class: "toolsInput toolsNum", type: "text", inputmode: "numeric", placeholder: String(Math.round(botManager.circleMinRadius(botManager.bots.length))), value: botManager.config.circleRadius, maxLength: 5, parent: moveGroup });
+        radField.oninput = function() { botManager.config.circleRadius = radField.value; };
+    }
+    var moveOpts = [["cursor", "Cursor (1req)"], ["circle", "Circle (2req)"], ["follow", "Follow (1req)"], ["manji", "Secret (17req)"]];
+    var moveLabel = "Cursor";
+    moveOpts.forEach(function(m) { if (m[0] === botManager.config.movement) moveLabel = m[1]; });
+    UTILS.generateElement({ class: "toolsDropHead" + (botManager.dropOpen ? " open" : ""), text: moveLabel + "  ▾", onclick: function() { botManager.dropOpen = !botManager.dropOpen; renderToolsMenu(); }, hookTouch: true, parent: moveGroup });
+    if (botManager.dropOpen) {
+        var moveList = UTILS.generateElement({ class: "toolsDropList", parent: toolsBody });
+        moveOpts.forEach(function(m) {
+            UTILS.generateElement({ class: "toolsDropOpt" + (botManager.config.movement === m[0] ? " on" : ""), text: m[1], onclick: function() { botManager.config.movement = m[0]; botManager.dropOpen = false; renderToolsMenu(); }, hookTouch: true, parent: moveList });
+        });
+    }
+    if (botManager.dropOpen && !botManager.movementDocHandler) {
+        botManager.movementDocHandler = function(e) {
+            if (e.type === "mousedown" && e.target && e.target.closest && e.target.closest(".toolsDropHead, .toolsDropList")) return;
+            botManager.dropOpen = false;
+            document.removeEventListener("mousedown", botManager.movementDocHandler, true);
+            document.removeEventListener("keydown", botManager.movementDocHandler, true);
+            botManager.movementDocHandler = null;
+            if (toolsMenu.style.display === "block") renderToolsMenu();
+        };
+        document.addEventListener("mousedown", botManager.movementDocHandler, true);
+        document.addEventListener("keydown", botManager.movementDocHandler, true);
+    } else if (!botManager.dropOpen && botManager.movementDocHandler) {
+        document.removeEventListener("mousedown", botManager.movementDocHandler, true);
+        document.removeEventListener("keydown", botManager.movementDocHandler, true);
+        botManager.movementDocHandler = null;
+    }
+
+    botManager.vals = { available: availCounter, generating: genCounter, lastMS: timeCounter, nextExpiry: expireCounter };
+    updateToolsValues();
+}
+
 function hideAllWindows() {
     storeMenu.style.display = "none";
     allianceMenu.style.display = "none";
     settingsMenu.style.display = "none";
+    toolsMenu.style.display = "none";
     closeChat();
 }
 
@@ -7563,6 +8098,38 @@ function selectSkinColor(index) {
 }
 
 var chatBox = document.getElementById("chatBox");
+var privateHolder = document.getElementById("privateHolder");
+var privateBox = document.getElementById("privateBox");
+function openPrivateChat() {
+    if (privateHolder.style.display === "block") { closePrivateChat(); return; }
+    privateHolder.style.display = "block";
+    privateBox.value = "";
+    privateBox.focus();
+    resetMoveDir();
+}
+function closePrivateChat() {
+    privateBox.value = "";
+    privateHolder.style.display = "none";
+    privateBox.blur();
+}
+function sendPrivate(v) {
+    relay.say(v);
+    if (player) { player.chatMessage = v; player.chatCountdown = config.chatCountdown; player.chatPrivate = true; }
+}
+privateBox.addEventListener("keydown", function(e) {
+    e.stopPropagation();
+    if (e.code === "Enter") {
+        e.preventDefault();
+        var v = privateBox.value.trim();
+        if (v.length > 0) sendPrivate(v);
+    } else if (e.code === "Escape") {
+        closePrivateChat();
+    }
+});
+privateBox.addEventListener("keyup", function(e) {
+    e.stopPropagation();
+    if (e.code === "Enter") closePrivateChat();
+});
 var chatHolder = document.getElementById("chatHolder");
 function toggleChat() {
     if (!usingTouch) {
@@ -7575,6 +8142,7 @@ function toggleChat() {
             storeMenu.style.display = "none";
             allianceMenu.style.display = "none";
             settingsMenu.style.display = "none";
+            toolsMenu.style.display = "none";
             chatHolder.style.display = "block";
             chatBox.focus();
             resetMoveDir();
@@ -7600,6 +8168,7 @@ function closeChat() {
 function receiveChat(sid, message) {
     var tmpPlayer = findPlayerBySID(sid);
     if (tmpPlayer) {
+        tmpPlayer.chatPrivate = false;
         tmpPlayer.chatMessage = message;
         tmpPlayer.chatCountdown = config.chatCountdown;
         notePlayer(sid, tmpPlayer.name, { lastMsg: message });
@@ -7743,7 +8312,7 @@ if (fullscreenControls && !isMobile) {
 function wheelZoom(e) {
     if (!player) return;
     if (e.ctrlKey || e.shiftKey || e.altKey) return;
-    if (e.target && e.target.closest && e.target.closest("#storeMenu, #chatLog, #allianceMenu, #settingsMenu")) return;
+    if (e.target && e.target.closest && e.target.closest("#storeMenu, #chatLog, #allianceMenu, #settingsMenu, #toolsMenu")) return;
     e.preventDefault();
     var wNow = Date.now();
     if (wNow - zoomSTime < 250) { zoomSTime = wNow; lastWheelTime = wNow; return; }
@@ -7912,7 +8481,9 @@ function resetMoveDir() {
 }
 function keysActive() {
     return (allianceMenu.style.display != "block"
-            && chatHolder.style.display != "block");
+            && chatHolder.style.display != "block"
+            && privateHolder.style.display != "block"
+            && toolsMenu.style.display != "block");
 }
 
 function flashText(life, msg) {
@@ -8022,6 +8593,9 @@ window.addEventListener("keydown", function(event) {
     if ((event.which||event.keyCode||0) == 32 && event.target == document.body) {
         event.preventDefault();
     }
+    if (event.key === "/" && event.target == document.body) {
+        event.preventDefault();
+    }
 });
 function keyUp(event) {
     if (keyBinds.shift === "K16") combatManager.shiftHeld = event.shiftKey;
@@ -8031,6 +8605,8 @@ function keyUp(event) {
         if (keyNum == 13) {
             if (allianceMenu.style.display === "block") return;
             toggleChat();
+        } else if (event.key === "/" && keysActive()) {
+            openPrivateChat();
         } else if (keysActive()) {
             if (keys[keyNum]) {
                 keys[keyNum] = false;
@@ -8432,7 +9008,7 @@ function barColorRamp(fraction, lAdj, sAdj, full) {
     const light = Math.round(lerp(60 + lAdj, 63.5 + lAdj, t));
     return `hsl(${hue}, ${sat}%, ${light}%)`;
 }
-function barColor(fraction) { return barColorRamp(fraction, 0, 0, "#78b7cc"); }
+function barColor(fraction) { return barColorRamp(fraction, 0, 0, "#68A4B9"); }
 function hudBarColor(fraction) { return barColorRamp(fraction, -3, 2, "#6bb2c9"); }
 
 function smoothBarFill(target, key, frac, dt, snapDown, rate) {
@@ -8478,7 +9054,7 @@ function updateGame() {
                 coX = player.x * 4 + (mouseWorldX - player.x) / 2;
                 coY = player.y * 4 + (mouseWorldY - player.y) / 2;
                 coC = 4;
-                var playersWeight = 0.45;
+                var playersWeight = 0.35;
                 for (var ci = 0; ci < players.length; ++ci) {
                     var op = players[ci];
                     if (op === player || !op.visible) continue;
@@ -8888,21 +9464,27 @@ function updateGame() {
 
                             var primaryReload = tmpObj.reloads[0];
                             var secondaryReload = tmpObj.reloads[1];
-                            var primaryRatio = smoothBarFill(tmpObj, "primaryReload", primaryReload.max > 0 ? Math.min(1, primaryReload.current / primaryReload.max) : 1, delta, true, 43 * Math.max(1, 3 / (primaryReload.max || 1)));
-                            var secondaryRatio = smoothBarFill(tmpObj, "secondaryReload", secondaryReload.max > 0 ? Math.min(1, secondaryReload.current / secondaryReload.max) : 1, delta, true, 43 * Math.max(1, 3 / (secondaryReload.max || 1)));
+                            var primaryRaw = primaryReload.max > 0 ? Math.min(1, primaryReload.current / primaryReload.max) : 1;
+                            var secondaryRaw = secondaryReload.max > 0 ? Math.min(1, secondaryReload.current / secondaryReload.max) : 1;
+                            var primaryRatio = settings.visuals.reloadSmooth ? smoothBarFill(tmpObj, "primaryReload", primaryRaw, delta, true, 43 * Math.max(1, 3 / (primaryReload.max || 1))) : primaryRaw;
+                            var secondaryRatio = settings.visuals.reloadSmooth ? smoothBarFill(tmpObj, "secondaryReload", secondaryRaw, delta, true, 43 * Math.max(1, 3 / (secondaryReload.max || 1))) : secondaryRaw;
                             var reloadInnerY = reloadY + config.healthBarPad - 0.5;
                             var reloadInnerH = 14 - config.healthBarPad * 2;
                             var reloadHalfGap = config.healthBarPad / 2.325;
                             var reloadHalf = config.healthBarWidth - reloadHalfGap;
+                            var reloadBarAlpha = mainContext.globalAlpha;
+                            mainContext.globalAlpha = reloadBarAlpha * (primaryRatio >= 1 ? 1 : 0.93);
                             mainContext.fillStyle = barColor(primaryRatio);
                             mainContext.roundRect(tmpObj.x - xOffset - config.healthBarWidth, reloadInnerY,
                                                   reloadHalf * primaryRatio, reloadInnerH, 7);
                             mainContext.fill();
 
+                            mainContext.globalAlpha = reloadBarAlpha * (secondaryRatio >= 1 ? 1 : 0.93);
                             mainContext.fillStyle = barColor(secondaryRatio);
                             mainContext.roundRect(tmpObj.x - xOffset + reloadHalfGap, reloadInnerY,
                                                   reloadHalf * secondaryRatio, reloadInnerH, 7);
                             mainContext.fill();
+                            mainContext.globalAlpha = reloadBarAlpha;
                         }
 
                         var turretReload = tmpObj.reloads[2];
@@ -8981,7 +9563,7 @@ function updateGame() {
                 var tmpY = tmpObj.y - tmpObj.scale - yOffset - (settings.visuals.nameStyle ? 87 : 90);
                 var tmpH = 47;
                 var tmpW = tmpObj.cached.chatWidth + 17;
-                mainContext.fillStyle = "rgba(0,0,0,0.2)";
+                mainContext.fillStyle = tmpObj.chatPrivate ? "lavender" : "rgba(0,0,0,0.2)";
                 mainContext.roundRect(tmpX-tmpW/2, tmpY-tmpH/2, tmpW, tmpH, 6);
                 mainContext.fill();
                 mainContext.fillStyle = "#fff";
@@ -11058,6 +11640,7 @@ function addPlayer(data, isYou) {
     if (!isYou && rec) pendingEncounters[tmpPlayer.sid] = { name: tmpPlayer.name, ordinal: rec.seen };
     if (isYou) {
         player = tmpPlayer;
+        relay.announce();
         aliveStart = Date.now();
         resyncArmTick = config.tick + 2;
         weaponXPTrack[0] = weaponXPTrack[1] = 0;
@@ -11526,8 +12109,8 @@ function applyPlannedUpgrades() {
 var upgradePresets = (function() {
     var o = items.weapons.length;
     return {
-        panelUpPH: [5, o + 1, o + 15, o + 7, 10, o + 22, o + 12, o + 8],
-        panelUpDH: [7, o + 1, o + 15, o + 7, 10, o + 22, o + 12, o + 8]
+        panelUpPH: [5, o + 1, o + 15, o + 7, 10, o + 22, o + 12, o + 9],
+        panelUpDH: [7, o + 1, o + 15, o + 7, 10, o + 22, o + 12, o + 9]
     };
 })();
 Object.keys(upgradePresets).forEach(function(id) {
@@ -11758,13 +12341,13 @@ function recordPacket(type, args) {
     line.textContent = '["' + type + '", [' + parts.join(", ") + ']]';
     line.style.color = customColors[Math.floor(Math.random() * customColors.length)];
     packetLog.appendChild(line);
-    while (packetLog.childNodes.length > 20) packetLog.removeChild(packetLog.firstChild);
+    while (packetLog.childNodes.length > 23) packetLog.removeChild(packetLog.firstChild);
     setTimeout(function() { if (line.parentNode === packetLog) packetLog.removeChild(line); }, 1000);
 }
 (function() {
     var container = document.createElement("div");
     container.id = "chatLog";
-    container.innerHTML = '<div id="messageContainer"></div><input id="chatInput" class="chat-input" type="text" maxlength="100" placeholder="To access private chat click here">';
+    container.innerHTML = '<div id="messageContainer"></div><input id="chatInput" class="chat-input" type="text" maxlength="100" placeholder="To access private chat click here or press /">';
     document.body.appendChild(container);
     _chatLog = container;
     _chatLog.style.display = "none";
@@ -11775,7 +12358,7 @@ function recordPacket(type, args) {
         if (e.code === "Enter") {
             e.preventDefault();
             var v = _chatInput.value.trim();
-            if (v.length > 0) relay.say(v);
+            if (v.length > 0) sendPrivate(v);
             _chatInput.value = "";
         } else if (e.code === "Escape") {
             _chatInput.blur();
@@ -11805,7 +12388,7 @@ function updateText() {
     if (textLoop) clearTimeout(textLoop);
     var t = config.tick, ms = Date.now();
     if (ms - ptPing >= 2500) { ptPing = ms; statsText.ping.textContent = settings.visuals.advancedStats ? (window.pingTime || 0) + "ms" : "Ping: " + (window.pingTime || 0) + " ms"; }
-    if (t - ptPps >= 2) { ptPps = t; statsText.pps.textContent = config.packets + "pps"; }
+    if (t - ptPps >= 2) { ptPps = t; statsText.pps.textContent = config.packets + "p/s"; }
     if (t - ptFps >= 5) { ptFps = t; statsText.fps.textContent = Math.round(fps) + "fps"; }
     if (ms - tpsLastMs >= 1000) {
         if (tpsLastMs > 0) { tpsVal = Math.round((t - tpsLastTick) / ((ms - tpsLastMs) / 1000)); statsText.tick.textContent = tpsVal + "tps"; }
