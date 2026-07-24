@@ -1,8 +1,8 @@
 /*!
  * // ==UserScript==
- * // @name         tailwind v10 loader
+ * // @name         tailwind v15 loader
  * // @namespace    tailwind
- * // @version      2026-07-19
+ * // @version      2026-07-24
  * // @description  tailwind
  * // @include      /^https?:\/\/sandbox.moomoo\.io\/?(\?.*)?$/
  * // @grant        none
@@ -21,9 +21,10 @@ window.cfOnToken = window.cfOnToken || function() {};
 
 var turnstile = {
     host: null,
+    slot: null,
     widgetID: null,
     hidden: "position:absolute;left:-99999px;top:0;width:300px;height:65px;",
-    shown:  "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;background:#fff;padding:10px;border-radius:6px;box-shadow:0 6px 24px rgba(0,0,0,0.35);",
+    shown:  "position:fixed;left:50%;top:50%;transform:translate(-50%,-50%);z-index:2147483647;display:flex;flex-direction:column;align-items:center;gap:11px;background:#fff;padding:8px 10px;border-radius:9px;border:1px solid rgba(0,0,0,0.08);box-shadow:0 10px 34px rgba(0,0,0,0.35);",
     hide:   function() { if (this.host) this.host.style.cssText = this.hidden; },
     reveal: function() { if (this.host) this.host.style.cssText = this.shown; },
     render: function() {
@@ -34,10 +35,16 @@ var turnstile = {
             this.host = document.createElement("div");
             this.host.id = "turnstileHost";
             this.host.style.cssText = this.hidden;
+            var header = document.createElement("div");
+            header.style.cssText = "text-align:center;color:#2b2b2b;font-family:'Hammersmith One',sans-serif;line-height:1.15;";
+            header.innerHTML = "<div style='font-size:18px;'>Tailwind</div><div style='font-size:12px;color:rgba(0,0,0,0.45);margin-top:1px;'>generate token</div>";
+            this.slot = document.createElement("div");
+            this.host.appendChild(header);
+            this.host.appendChild(this.slot);
             document.documentElement.appendChild(this.host);
         }
         try {
-            this.widgetID = window.turnstile.render(this.host, {
+            this.widgetID = window.turnstile.render(this.slot, {
                 sitekey: siteKey,
                 theme: "light",
                 appearance: "interaction-only",
