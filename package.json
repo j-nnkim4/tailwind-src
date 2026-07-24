@@ -1,6 +1,6 @@
 {
   "name": "tailwind-src",
-  "version": "10.0.0",
+  "version": "15.0.0",
   "description": "tailwind userscript bundle, un-bundled. just for reading, not a build. also hosts the private chat relay.",
   "author": "jason",
   "license": "MIT",
